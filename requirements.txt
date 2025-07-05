@@ -1,0 +1,5 @@
+numpy>=2.0.0
+ipython>=9.0.0
+ipykernel>=6.0.0
+matplotlib>=3.0.0
+torch>=2.0.0
