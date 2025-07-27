@@ -6,6 +6,10 @@ This repository contains code for my research on a modified method of OLS (ortho
 ## Relevant Papers
 
 - [Original OLS algorithm for RBF networks](https://core.ac.uk/download/pdf/1497907.pdf)
+- [One of the articles that introduced RBF-AR](https://www.tandfonline.com/doi/abs/10.1080/002077299292038)
+- [RBF-AR parameter optimization](https://link.springer.com/article/10.1007/s11071-021-06580-3)
+- [RBF-AR applications](https://www.tandfonline.com/doi/abs/10.1080/00207721.2014.955552)
+- [Adaptive learning for RBF-AR methods](https://ieeexplore.ieee.org/abstract/document/8743462)
 
 ## Formulation of the problem
 
