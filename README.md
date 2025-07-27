@@ -96,8 +96,8 @@ Select the centre $c_i$ with the highest ${err}_i$.
 
 $$
 C^{(k)} = C^{(k - 1)} \cup \{c_i\} \\[5pt]
-W^{(k)} = [W^{(k - 1)}, w_i] \\[5pt]
-g^{(k)} = [g^{(k - 1)}, g_i] \\[5pt]
+W^{(k)} = W^{(k - 1)} \oplus [w_i] \\[5pt]
+g^{(k)} = g^{(k - 1)} \oplus [g_i] \\[5pt]
 d^{(k)} = d^{(k - 1)} - w_i \cdot g_i \\[5pt]
 $$
 
