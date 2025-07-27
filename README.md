@@ -17,14 +17,15 @@ $$
 
 X \in \mathbb{R}^{l \times n} \\
 d \in \mathbb{R}^{l \times 1} \\
-\Psi: \mathbb{R}^{n} \rightarrow {[0,1]}^{m} \\
-\Phi \in {[0,1]}^{l \times m} \\
+\Psi: \mathbb{R}^{n} \rightarrow {[0,1]}^{m}, \\[2pt]
 \Phi_i = \Psi(X_i) \\
 \Nu \in \mathbb{R}^{m \times n} \\
 
 $$
 
-### First formulation (not directly applicable to OLS, due to not being able to invert the equation):
+**Note:** the target variable $d$ should be normalized, so it has a mean of 0. These models only work well for stationary data, but for data with a trend, this normalization should be done via a trend removal method.
+
+### First approach (not directly applicable to OLS, due to not being able to invert the equation):
 
 $$
 
@@ -34,7 +35,71 @@ y_i = \Psi(X_i) \cdot (X_i \cdot \Nu ^ T) \\
 \implies \Nu = ?
 $$
 
-### Second formulation (applicable to OLS):
+**Solution:** first fit an AR model to each candidate centre, and then select from them and assign weights to each selected one.
+
+Let $\Xi_i$ be the set of training sample indicies associated with the $i$th candidate centre. We define $\Xi_i$ as follows:
+$$
+\Xi_i = \{j \in [1, l] \: | \Psi_i(X_j) \geq \rho\}, \\[5pt]
+\text{where } \rho \text{ is a threshold for the candidate centre selection, and }\\ \Psi_i(X_j) \text{ is the } i\text{th element of } \Psi(X_j) \\[5pt]
+$$
+
+Let $\nu_i$ be the coefficient-vector associated with the $i$th candidate centre.
+
+We fit each linear AR model separately, using a standard least squares approach:
+
+$$
+\hat{\nu}_i = \arg\min_{\nu_i} \sum_{j \in \Xi_i} (d_j - X_j \cdot \nu_i)^2 \\[5pt]
+$$
+
+Let $\Nu$ be the matrix of these coefficients:
+
+$$
+\Nu = \begin{bmatrix}
+\hat{\nu}_1 \\
+\hat{\nu}_2 \\
+\vdots \\
+\hat{\nu}_m
+\end{bmatrix}
+$$
+
+Now we can calculate the activation matrix $\Sigma$. This matrix represents the output for each training point $i$ and each linear AR model, associated with the $j$th candidate centre:
+
+$$
+\Sigma = \Phi \odot (X \cdot \Nu^T) \\[5pt]
+\Sigma_{i,j} = \Psi_j(X_i) \cdot (X_i \cdot \hat{\nu}_j^T) \\[5pt]
+\Sigma = \begin{bmatrix}
+\Psi_1(X_1) \cdot (X_1 \cdot \hat{\nu}_1^T) & \Psi_2(X_1) \cdot (X_1 \cdot \hat{\nu}_2^T) & \ldots & \Psi_m(X_1) \cdot (X_1 \cdot \hat{\nu}_m^T) \\
+\Psi_1(X_2) \cdot (X_2 \cdot \hat{\nu}_1^T) & \Psi_2(X_2) \cdot (X_2 \cdot \hat{\nu}_2^T) & \ldots & \Psi_m(X_2) \cdot (X_2 \cdot \hat{\nu}_m^T) \\
+\vdots & \vdots & \ddots & \vdots \\
+\Psi_1(X_l) \cdot (X_l \cdot \hat{\nu}_1^T) & \Psi_2(X_l) \cdot (X_l \cdot \hat{\nu}_2^T) & \ldots & \Psi_m(X_l) \cdot (X_l \cdot \hat{\nu}_m^T)
+\end{bmatrix}\\[5pt]
+$$
+
+From now, we can continue with the OLS approach, such that the activations, normally denoted by $P$ are given by the $\Sigma$ matrix ($P = \Sigma$).
+
+We then select the centres and assign coefficients ($\theta_i$) to each selected centre using the OLS approach.
+
+$$
+d = \Sigma \cdot \theta + e \\[5pt]
+$$
+
+The details are left out here, as they are similar to the OLS approach described below.
+
+Having completed this step, we get:
+
+$$
+y = (\Phi \odot (X \cdot \Nu^T)) \cdot \theta
+$$
+
+This can be rewritten as the original equation, with the weights modified:
+
+$$
+y = (\Phi \odot (X \cdot \tilde{\Nu}^T)) \cdot \underline{1}, \\[5pt]
+\text{where } \tilde{\Nu} = \Nu \odot \theta
+$$
+
+
+### Second approach (applicable to OLS):
 
 We flatten the $\Nu$ matrix into a vector $\nu$ and rewrite the equation as follows:
 
