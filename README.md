@@ -80,8 +80,11 @@ $$
 - initialize the selected centres: $C^{(0)} = \emptyset$
 - initialize $W$ to an empty matrix: $W^{(0)} = \emptyset$
 - initialize $g$ to an empty vector: $g^{(0)} = \emptyset$
+- initialize the selected indicies $I_\text{selected}^{(0)} = \emptyset$
 
-**At each iteration ($k \in [1, |C|]$):**
+**At each iteration ($k \in [1, |C_\text{candidates}|]$):**
+
+**$\forall i \in [1, |C_\text{candidates}|] \setminus I_\text{selected}^{(k - 1)}$**
 
 $$
 
@@ -95,9 +98,10 @@ $$
 Select the centre $c_i$ with the highest ${err}_i$.
 
 $$
+I_\text{selected}^{(k)} = I_\text{selected}^{(k - 1)} \cup \{i\} \\[5pt]
 C^{(k)} = C^{(k - 1)} \cup \{c_i\} \\[5pt]
-W^{(k)} = W^{(k - 1)} \oplus [w_i] \\[5pt]
-g^{(k)} = g^{(k - 1)} \oplus [g_i] \\[5pt]
+W^{(k)} = W^{(k - 1)} \oplus w_i \\[5pt]
+g^{(k)} = g^{(k - 1)} \oplus g_i \\[5pt]
 d^{(k)} = d^{(k - 1)} - w_i \cdot g_i \\[5pt]
 $$
 
