@@ -84,7 +84,7 @@ $$
 
 **At each iteration ($k \in [1, |C_\text{candidates}|]$):**
 
-**$\forall i \in [1, |C_\text{candidates}|] \setminus I_\text{selected}^{(k - 1)}$**
+**$\forall i \in [1, |C_\text{candidates}|] \setminus I_\text{selected}^{(k - 1)}:$**
 
 $$
 
