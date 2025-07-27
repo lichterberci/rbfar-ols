@@ -112,12 +112,11 @@ If any of the stopping criteria is met, the algorithm terminates with $M_S = k$.
 ### Finding the coefficients
 
 $$
-d \approx W \cdot g = P \cdot \nu = W \cdot A \cdot \nu \\[5pt]
+d = W \cdot g + e = P \cdot \nu = W \cdot A \cdot \nu + e \approx W \cdot \hat{g} \\[5pt]
 \text{W has orthogonal columns } \implies W^T \cdot W = H, \\ \text{ where } H \text{ is a diagonal matrix, and thus invertible} \\[5pt]
-W^T \cdot W \cdot g = W^T \cdot W \cdot A \cdot \nu \\
-H \cdot g = H \cdot A \cdot \nu \\
-H^{-1} \cdot H \cdot g = H^{-1} \cdot H \cdot A \cdot \nu \\
-g = A \cdot \nu
+\text{We can calculate } \hat{g} \text{ by } H^{-1}\cdot W^T \cdot d = \hat{g}  \\[5pt]
+\implies A \cdot \hat{\nu} = H^{-1} \cdot W^T \cdot d \\
+A \cdot \hat{\nu} = \hat{g}
 $$
 
 which is easily and efficiently solvable, due to $A$ being an upper triangular matrix.
