@@ -30,8 +30,8 @@ $$
 
 y_i = \Psi(X_i) \cdot (X_i \cdot \Nu ^ T) \\
 
-\implies y = \left( \Phi \odot (X \cdot \Nu ^ T) \right) \cdot \underline{1} \\
-d = y \implies \Nu = ?
+\implies d \approx y = \left( \Phi \odot (X \cdot \Nu ^ T) \right) \cdot \underline{1} \\
+\implies \Nu = ?
 $$
 
 ### Second formulation (applicable to OLS):
