@@ -333,7 +333,7 @@ We can refine this process by optimizing the calculation of $\text{Error}_k$. We
 
 $$
 \begin{align*}
-\text{Error}_0 = \lVert d \rVert_2^2 \\
+\text{Error}_0 &= \lVert d \rVert_2^2 \\
 \text{Error}_k - \text{Error}_{k-1} &= \lVert d - Q^{(k)} \Sigma^{(k)} Q^{(k)T} d \rVert_2^2 - \lVert d - Q^{(k-1)} \Sigma^{(k-1)} Q^{(k-1)T} d \rVert_2^2 \\
 &= \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k-1}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
@@ -349,10 +349,16 @@ $$
 \boxed{\text{Error}_k - \text{Error}_{k-1} = \sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2}
 $$
 
-Thus, we get our optimized centre-selection loop:
+To be able to consistently use the same sort of $\epsilon$ values, we can normalize the error by dividing it by the initial error:
 
-1. Error$_0$ := $\lVert d \rVert_2^2$
+$$
+\text{Normalized Error}_k = \frac{\text{Error}_k}{\text{Error}_0} = \frac{\text{Error}_k}{\lVert d \rVert_2^2}
+$$
+
+Thus, we get our optimized centre-selection algorithm:
+
+1. Normalized Error$_0$ := 1
 2. While k < $|C_\text{candidates}|$:
-   1. Error$_k$ := Error$_{k-1}$ + $\sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2$
-   2. If Error$_k$ < $\epsilon$ then:
+   1. Normalized Error$_k$ := Normalized Error$_{k-1} + \sigma_k'\left(\sigma_k' - 2\right)\frac{\left( q_k^T d \right)^2}{\lVert d \rVert_2^2}$
+   2. If Normalized Error$_k$ < $\epsilon$ then:
       1. Stop
