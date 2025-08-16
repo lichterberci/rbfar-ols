@@ -345,6 +345,10 @@ $$
 \end{align*}
 $$
 
+$$
+\boxed{\text{Error}_k - \text{Error}_{k-1} = \sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2}
+$$
+
 Thus, we get our optimized centre-selection loop:
 
 1. Error$_0$ := $\lVert d \rVert_2^2$
