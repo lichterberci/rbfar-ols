@@ -107,4 +107,8 @@ class SvdOlsOptimizer:
 
         selected_indicies = torch.nonzero(torch.abs(nu_hat) > self._delta).squeeze()
 
-        return selected_indicies, nu_hat[selected_indicies]
+        return (
+            (selected_indicies, nu_hat[selected_indicies])
+            if not should_return_result_as_numpy
+            else (selected_indicies.numpy(), nu_hat[selected_indicies].numpy())
+        )
