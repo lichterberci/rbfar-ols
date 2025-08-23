@@ -219,7 +219,7 @@ We then get the following equation for the optimal weights:
 
 $$
 \large
-\hat{\nu} = \argmin_{\nu} {\lVert d - P \cdot \nu + \alpha {\small \lVert \nu \rVert}_2^2 \rVert }_2^2,
+\hat{\nu} = \argmin_{\nu} \{ {\lVert d - P \cdot \nu \rVert }_2^2 + \alpha {\small \lVert \nu \rVert}_2^2 \} ,
 $$
 
 where $\alpha$ is a regularization parameter.  
@@ -227,7 +227,7 @@ We can transform this as follows:
 
 $$
 \begin{align*}
-\hat{\nu} &=  \argmin_{\nu} { \bigl\{ \lVert d - P \cdot \nu + \alpha {\small \lVert \nu \rVert}_2^2 \rVert }_2^2 \bigr\} \\
+\hat{\nu} &=  \argmin_{\nu} { \bigl\{ \lVert d - P \cdot \nu \rVert }_2^2 + \alpha{\small \lVert \nu \rVert}_2^2 \} \\
 &= \argmin_{\nu}{\bigl\{d^T d - 2\nu^T P^T d + \nu^T P^T P \nu + \alpha \nu^T \nu\bigr\}}\\
 \implies \frac{\delta}{\delta \nu} &= -2P^T d + 2P^T P \nu + 2\alpha \nu = 0\\
 \implies \hat{\nu} &= \left(P^T P + \alpha I\right)^{-1} P^T d\\
@@ -339,7 +339,7 @@ $$
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k-1}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
 &=\left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{\sigma_i'\left( q_i^T d \right)^2} + \sum_{i = 1}^{k}{\sigma_i'^{\:2} \left(q_i^T d\right)^2}\right)\\
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{\sigma_i'\left( q_i^T d \right)^2} + \sum_{i = 1}^{k-1}{ \sigma_i'^{\:2} \left(q_i^T d\right)^2}\right)\\
-&=\left( \lVert d \rVert_2^2 + \sum_{i=1}^k{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right)\\
+&=\left( \lVert d \rVert_2^2 + \sum_{i=1}^k{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right)\\****
 &\:\:\:\:-\left( \lVert d \rVert_2^2 + \sum_{i=1}^{k-1}{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right) \\
 &= \sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2
 \end{align*}

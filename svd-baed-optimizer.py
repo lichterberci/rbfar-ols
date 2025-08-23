@@ -1,9 +1,12 @@
+"""This module implements an SVD-based optimizer for calculating the optimal sparse linear combination."""
+
 from typing import Tuple
+
 import numpy as np
 import torch
 
 
-class SvdOlsOptimizer:
+class SvdOptimizer:
     """
     This class performs SVD-based optimization for OLS regression.
     For further details, please refer to the documentation.
@@ -105,10 +108,10 @@ class SvdOlsOptimizer:
             regularized_sigma_inv[:m_selected] * (Q[:, :m_selected].T @ d)
         )
 
-        selected_indicies = torch.nonzero(torch.abs(nu_hat) > self._delta).squeeze()
+        selected_indices = torch.nonzero(torch.abs(nu_hat) > self._delta).squeeze()
 
         return (
-            (selected_indicies, nu_hat[selected_indicies])
+            (selected_indices, nu_hat[selected_indices])
             if not should_return_result_as_numpy
-            else (selected_indicies.numpy(), nu_hat[selected_indicies].numpy())
+            else (selected_indices.numpy(), nu_hat[selected_indices].numpy())
         )

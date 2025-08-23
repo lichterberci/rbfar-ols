@@ -1,6 +1,9 @@
 {
     "cSpell.words": [
+        "cand",
         "linalg",
-        "pinv"
+        "numer",
+        "pinv",
+        "triu"
     ]
 }
