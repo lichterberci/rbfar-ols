@@ -27,21 +27,18 @@ class SvdOptimizer:
 
     def optimize(
         self,
-        P: torch.tensor | np.ndarray[np.floating],
-        d: torch.tensor | np.ndarray[np.floating],
-    ) -> (
-        Tuple[torch.tensor, torch.tensor]
-        | Tuple[np.ndarray[np.integer], np.ndarray[np.floating]]
-    ):
+        P: torch.Tensor | np.ndarray,
+        d: torch.Tensor | np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[np.ndarray, np.ndarray]:
         """
         This is the main function of the optimizer. It performs an SVD-decomposition on P and then finds the optimal sparse linear combination and returns it in the form of a tensor or a numpy array.
 
         Args:
-            P (torch.tensor | np.ndarray[np.floating]): The design matrix of the input.
-            d (torch.tensor | np.ndarray[np.floating]): The target vector.
+            P (torch.Tensor | np.ndarray): The design matrix of the input.
+            d (torch.Tensor | np.ndarray): The target vector.
 
         Returns:
-            Tuple[torch.tensor, torch.tensor] | Tuple[np.ndarray[np.integer], np.ndarray[np.floating]]: The indices of the selected centres and the corresponding weights.
+            Tuple[torch.Tensor, torch.Tensor] | Tuple[np.ndarray, np.ndarray]: The indices of the selected centres and the corresponding weights.
         """
         if not (
             isinstance(P, (torch.Tensor, np.ndarray))
@@ -68,47 +65,48 @@ class SvdOptimizer:
         if isinstance(d, np.ndarray):
             d = torch.from_numpy(d)
 
-        # Perform SVD
-        # NOTE: sigma is only the diagonal vector of the Sigma matrix
-        Q, sigma, VT = torch.svd(P, some=True, compute_uv=True)
-
-        V = VT.T
+        # Perform reduced SVD: P = U @ diag(sigma) @ Vh
+        # Shapes: U (l, k), sigma (k,), Vh (k, m), where k = min(l, m)
+        U, sigma, Vh = torch.linalg.svd(P, full_matrices=False)
 
         # reg_sigma_inv = (Sigma^T @ Sigma + alpha * I)^-1 @ Sigma^T
         regularized_sigma_inv = sigma / (sigma**2 + self._alpha)
 
-        # err_0 = ||d||_2^2
-        # --> in the maths notes, it is indexed from k=1,
-        # but in the implementation, we index k from 0
-        d_norm_squared = d.T @ d
+        # err_0 = ||d||_2^2 (normalized stopping uses ratio err/||d||^2)
+        d_norm_squared = torch.dot(d, d)
 
-        err = d_norm_squared
+        sigma_prime = (
+            sigma * regularized_sigma_inv
+        )  # = sigma^2 / (sigma^2 + alpha) in (0,1)
 
-        sigma_prime = sigma * regularized_sigma_inv
-
-        m_selected = None
-
-        for k in range(m):
-            err_k = (
-                err
-                + sigma_prime[k]
-                * (sigma_prime[k] - 2)
-                * (Q[:, k].T @ d) ** 2
-                / d_norm_squared
-            )
-
-            if err_k < self._epsilon:
+        # Select number of components by normalized residual threshold; compute z_k lazily
+        k_max = sigma.shape[0]
+        m_selected = k_max
+        err = d_norm_squared.clone()
+        z_vals: list[torch.Tensor] = []
+        for k in range(k_max):
+            z_k = torch.dot(U[:, k], d)
+            z_vals.append(z_k)
+            err = err + sigma_prime[k] * (sigma_prime[k] - 2.0) * (z_k**2)
+            if (err / (d_norm_squared + 1e-12)) < self._epsilon:
                 m_selected = k + 1
                 break
-        else:
-            m_selected = m
 
         # Calculate the optimal weights (for all possible centroids)
-        nu_hat = V[:m_selected, :] @ (
-            regularized_sigma_inv[:m_selected] * (Q[:, :m_selected].T @ d)
+        # Truncated regularized solution: x_hat = V @ diag(reg_sigma_inv) @ U^T d
+        # Build z for selected components only
+        if m_selected > 0:
+            z_selected = torch.stack(z_vals[:m_selected])
+        else:
+            z_selected = torch.empty(0, dtype=P.dtype, device=P.device)
+
+        nu_hat = Vh[:m_selected, :].transpose(0, 1) @ (
+            regularized_sigma_inv[:m_selected] * z_selected
         )
 
-        selected_indices = torch.nonzero(torch.abs(nu_hat) > self._delta).squeeze()
+        # Robust 1D indices with sparsity control
+        abs_w = torch.abs(nu_hat)
+        selected_indices = torch.nonzero(abs_w > self._delta, as_tuple=True)[0]
 
         return (
             (selected_indices, nu_hat[selected_indices])
