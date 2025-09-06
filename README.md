@@ -26,7 +26,7 @@ $$
 
 **Note:** the target variable $d$ should be normalized, so it has a mean of 0. These models only work well for stationary data, but for data with a trend, this normalization should be done via a trend removal method.
 
-### First approach
+### First approach (locally pre-trained coefficients)
 
 $$
 \begin{aligned}
@@ -59,10 +59,10 @@ Let $\Nu$ be the matrix of these coefficients:
 
 $$
 \Nu = \begin{bmatrix}
-\hat{\nu}_1 \\
-\hat{\nu}_2 \\
+\hat{\nu}_1^T \\
+\hat{\nu}_2^T \\
 \vdots \\
-\hat{\nu}_m
+\hat{\nu}_m^T
 \end{bmatrix}
 $$
 
@@ -107,7 +107,7 @@ y &= (\Phi \odot (X \cdot \tilde{\Nu}^T)) \cdot \underline{1}, \\[5pt]
 $$
 
 
-### Second approach
+### Second approach (no pre-training)
 
 We flatten the $\Nu$ matrix into a vector $\nu$ and rewrite the equation as follows:
 

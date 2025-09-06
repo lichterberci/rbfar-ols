@@ -5,8 +5,22 @@ from typing import Tuple
 import numpy as np
 import torch
 
+try:
+    from optimizer import Optimizer
+except ModuleNotFoundError:
+    import importlib.util
+    from pathlib import Path
 
-class SvdOptimizer:
+    _root = Path(__file__).resolve().parent
+    _opt_path = _root / "optimizer.py"
+    _spec = importlib.util.spec_from_file_location("optimizer", str(_opt_path))
+    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+    assert _spec and _spec.loader
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    Optimizer = _mod.Optimizer
+
+
+class SvdOptimizer(Optimizer):
     """
     This class performs SVD-based optimization for OLS regression.
     For further details, please refer to the documentation.
@@ -40,30 +54,10 @@ class SvdOptimizer:
         Returns:
             Tuple[torch.Tensor, torch.Tensor] | Tuple[np.ndarray, np.ndarray]: The indices of the selected centres and the corresponding weights.
         """
-        if not (
-            isinstance(P, (torch.Tensor, np.ndarray))
-            and isinstance(d, (torch.Tensor, np.ndarray))
-        ):
-            raise TypeError("P and d must be either torch.Tensor or np.ndarray")
-
-        should_return_result_as_numpy = isinstance(P, np.ndarray) and isinstance(
-            d, np.ndarray
-        )
-
-        if P.ndim != 2 or d.ndim != 1:
-            raise ValueError("Incompatible shapes: P must be 2D and d must be 1D.")
-
-        l, m = P.shape
-
-        if l != d.shape[0]:
-            raise ValueError(
-                "Incompatible shapes: P and d must have the same number of rows."
-            )
-
-        if isinstance(P, np.ndarray):
-            P = torch.from_numpy(P)
-        if isinstance(d, np.ndarray):
-            d = torch.from_numpy(d)
+        # Validate inputs and unify types
+        _, _ = self._validate_inputs(P, d)
+        should_return_result_as_numpy = self._should_return_numpy(P, d)
+        P, d, _, _ = self._to_torch(P, d)
 
         # Perform reduced SVD: P = U @ diag(sigma) @ Vh
         # Shapes: U (l, k), sigma (k,), Vh (k, m), where k = min(l, m)
@@ -111,5 +105,8 @@ class SvdOptimizer:
         return (
             (selected_indices, nu_hat[selected_indices])
             if not should_return_result_as_numpy
-            else (selected_indices.numpy(), nu_hat[selected_indices].numpy())
+            else (
+                selected_indices.cpu().numpy(),
+                nu_hat[selected_indices].cpu().numpy(),
+            )
         )

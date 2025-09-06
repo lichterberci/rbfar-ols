@@ -4,6 +4,7 @@
         "linalg",
         "numer",
         "pinv",
+        "pretraining",
         "sqrd",
         "triu"
     ],

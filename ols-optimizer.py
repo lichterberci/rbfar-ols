@@ -2,8 +2,22 @@ from typing import Tuple
 import numpy as np
 import torch
 
+try:
+    from optimizer import Optimizer
+except ModuleNotFoundError:  # when loaded via importlib by path in tests
+    import importlib.util
+    from pathlib import Path
 
-class OlsOptimizer:
+    _root = Path(__file__).resolve().parent
+    _opt_path = _root / "optimizer.py"
+    _spec = importlib.util.spec_from_file_location("optimizer", str(_opt_path))
+    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+    assert _spec and _spec.loader
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    Optimizer = _mod.Optimizer
+
+
+class OlsOptimizer(Optimizer):
     """
     Ordinary Least Squares (OLS) forward-selection optimizer.
 
@@ -73,51 +87,10 @@ class OlsOptimizer:
             where k is the number of selected features (k ≤ m).
         - This method runs under torch.no_grad() and does not track gradients.
         """
-
-        if not (
-            isinstance(P, (torch.Tensor, np.ndarray))
-            and isinstance(d, (torch.Tensor, np.ndarray))
-        ):
-            raise TypeError("P and d must be either torch.Tensor or np.ndarray")
-
-        # Whether to return numpy
-        should_return_result_as_numpy = isinstance(P, np.ndarray) and isinstance(
-            d, np.ndarray
-        )
-
-        # Shapes and basic checks
-        if isinstance(P, np.ndarray):
-            l, m = P.shape
-        else:
-            l, m = P.shape  # type: ignore[assignment]
-        if isinstance(d, np.ndarray):
-            if d.ndim != 1:
-                raise ValueError("d must be 1D")
-            if d.shape[0] != l:
-                raise ValueError("Incompatible shapes: P and d must have same rows.")
-        else:
-            if d.ndim != 1 or d.shape[0] != l:
-                raise ValueError(
-                    "Incompatible shapes: P and d must have same rows and d 1D."
-                )
-
-        # Device and dtype
-        if isinstance(P, torch.Tensor):
-            device = P.device
-            float_dtype = P.dtype
-        else:
-            device = torch.device("cpu")
-            float_dtype = torch.float32
-
-        # Convert to torch tensors on the same device/dtype
-        if isinstance(P, np.ndarray):
-            P_t = torch.from_numpy(P).to(device=device, dtype=float_dtype)
-        else:
-            P_t = P
-        if isinstance(d, np.ndarray):
-            d_t = torch.from_numpy(d).to(device=device, dtype=float_dtype)
-        else:
-            d_t = d
+        # Validate inputs and unify types
+        l, m = self._validate_inputs(P, d)
+        should_return_result_as_numpy = self._should_return_numpy(P, d)
+        P_t, d_t, device, float_dtype = self._to_torch(P, d)
 
         # Centralize target (same behaviour as before)
         d_centered = d_t - d_t.mean()
