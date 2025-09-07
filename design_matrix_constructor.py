@@ -233,6 +233,8 @@ def construct_design_matrix_with_local_pretraining(
     radial_basis_function: RadialBasisFunction = RadialBasisFunction.GAUSSIAN,
     sigma: Optional[float | int | torch.Tensor | np.ndarray] = None,
     ridge: float = 1e-8,
+    rho: float = 0.05,
+    return_weights: bool = False,
 ):
     """Build the design matrix P for the "first approach" (locally pre-trained).
 
@@ -251,6 +253,9 @@ def construct_design_matrix_with_local_pretraining(
         radial_basis_function: RBF type used to build phi.
         sigma: Optional bandwidth; if None, median-heuristic is used.
         ridge: Small non-negative Tikhonov regularization to stabilize WLS.
+        rho: Non-negative threshold for local support; points with RBF activation
+            below rho are ignored in the local fit. Default 0.05.
+        return_weights: If True, also return the local model weights of shape (m, n).
 
     Returns:
         P with shape (l, m), same array/tensor type as X.
@@ -350,34 +355,31 @@ def construct_design_matrix_with_local_pretraining(
                 f"Unsupported radial_basis_function: {radial_basis_function}"
             )
 
-    # Local WLS for each centre j
     if ridge < 0:
         raise ValueError("ridge must be non-negative")
-    eye = torch.eye(n, device=device, dtype=dtype)
-    cols = []
-    for j in range(m):
-        w_j = phi[:, j]
-        if torch.all(w_j <= 0):
-            cols.append(torch.zeros(l, device=device, dtype=dtype))
-            continue
-        # Weighted design: multiply by sqrt(weights)
-        sqrt_w = torch.sqrt(torch.clamp(w_j, min=0))
-        Xw = X_t * sqrt_w.unsqueeze(1)
-        dw = d_t * sqrt_w
-        # Normal equations with Tikhonov regularization for stability
-        a = Xw.transpose(0, 1) @ Xw + ridge * eye
-        b = Xw.transpose(0, 1) @ dw
-        try:
-            coef = torch.linalg.solve(a, b)
-        except RuntimeError:
-            # Fallback to least squares if a is singular
-            coef = torch.linalg.lstsq(a, b.unsqueeze(1)).solution.squeeze(1)
-        z_j = X_t @ coef
-        cols.append(w_j * z_j)
 
-    p_t = torch.stack(cols, dim=1)  # (l, m)
+    eye = torch.eye(n, device=device, dtype=dtype)
+    P = torch.zeros((l, m), device=device, dtype=dtype)
+    # Vectorized computation to replace the loop
+    Xi_mask = torch.where(
+        phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
+    )  # (l, m)
+    X_masked_out = Xi_mask.unsqueeze(-1) * X_t.unsqueeze(1)  # (l, m, n)
+    a = torch.einsum("lmi, lj -> mij", X_masked_out, X_t) + ridge * eye.unsqueeze(
+        0
+    )  # (m, n, n)
+    b = torch.einsum("lmi, l -> mi", X_masked_out, d_t)  # (m, n)
+    nu_hat = torch.linalg.solve(a, b)  # (m, n)
+    P = phi * (X_t @ nu_hat.T)  # (l, m)
 
     if return_numpy:
         np_dtype = np.float64 if dtype == torch.float64 else np.float32
-        return p_t.cpu().numpy().astype(np_dtype, copy=False)
-    return p_t
+        return (
+            P.cpu().numpy().astype(np_dtype, copy=False)
+            if not return_weights
+            else (
+                P.cpu().numpy().astype(np_dtype, copy=False),
+                nu_hat.cpu().numpy().astype(np_dtype, copy=False),
+            )
+        )
+    return P if not return_weights else (P, nu_hat)
