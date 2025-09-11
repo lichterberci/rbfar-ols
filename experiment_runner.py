@@ -33,7 +33,9 @@ class ExperimentResult:
     """Common return type containing only predicted time-series results."""
 
     train_predictions: np.ndarray  # Predicted values for training set
+    train_targets: np.ndarray  # True target values for training set
     test_predictions: np.ndarray  # Predicted values for test set
+    test_targets: np.ndarray  # True target values for test set
     method_name: str  # Name of the method used
     metadata: Dict[str, Any] = (
         None  # Optional metadata (execution time, parameters used, etc.)
@@ -319,11 +321,14 @@ def run_proposed_experiment(
         "approach": config.approach,
         "optimizer_type": type(config.optimizer).__name__,
         "post_tuned": config.post_tune,
+        "optimizer_params": vars(config.optimizer),
     }
 
     return ExperimentResult(
         train_predictions=train_pred,
         test_predictions=test_pred,
+        train_targets=d_train.cpu().numpy(),
+        test_targets=d_test.cpu().numpy(),
         method_name=f"PROPOSED-{config.approach}-{type(config.optimizer).__name__}",
         metadata=metadata,
     )
@@ -509,6 +514,8 @@ def run_control_experiment(
     return ExperimentResult(
         train_predictions=train_pred,
         test_predictions=test_pred,
+        train_targets=d_train.cpu().numpy(),
+        test_targets=d_test.cpu().numpy(),
         method_name="Control-Adam-RBF",
         metadata=metadata,
     )
@@ -577,6 +584,7 @@ def run_comparison_experiments(
     train_ratio: float = 0.7,
     device: str = "cpu",
     run_parallel: bool = False,
+    show_progress: bool = True,
 ) -> Tuple[Union[ExperimentResult, List[ExperimentResult]], ExperimentResult]:
     """
     Run proposed method(s) and control experiments for comparison.
@@ -588,6 +596,7 @@ def run_comparison_experiments(
         train_ratio: Training data ratio
         device: Device to run on (for GPU parallelism, use "cuda" but see notes below)
         run_parallel: If True, run experiments in parallel; if False, run sequentially
+        show_progress: If True, show progress bars during lag estimation
 
     Returns:
         Tuple of (proposed_result(s), control_result)
@@ -605,21 +614,34 @@ def run_comparison_experiments(
     if ctrl_config is None:
         ctrl_config = create_default_control_config()
 
+    progress_bar = tqdm(
+        (
+            range(len(proposed_config) + 1)
+            if isinstance(proposed_config, list)
+            else range(2)
+        ),
+        disable=not show_progress,
+        desc="Running Experiments",
+        unit="experiment",
+    )
+
+    run_proposed_exp_and_update_progress = lambda cfg: (
+        progress_bar.update(1),
+        run_proposed_experiment(series, cfg, train_ratio, device),
+    )[1]
+    run_control_exp_and_update_progress = lambda: (
+        progress_bar.update(1),
+        run_control_experiment(series, ctrl_config, train_ratio, device),
+    )[1]
     # Handle single config case
     if isinstance(proposed_config, ProposedMethodConfig):
         if run_parallel and device == "cpu":
             # True parallelism only beneficial on CPU
             with ThreadPoolExecutor(max_workers=2) as executor:
                 proposed_future = executor.submit(
-                    run_proposed_experiment,
-                    series,
-                    proposed_config,
-                    train_ratio,
-                    device,
+                    run_proposed_exp_and_update_progress, proposed_config
                 )
-                control_future = executor.submit(
-                    run_control_experiment, series, ctrl_config, train_ratio, device
-                )
+                control_future = executor.submit(run_control_exp_and_update_progress)
 
                 proposed_result = proposed_future.result()
                 control_result = control_future.result()
@@ -631,12 +653,8 @@ def run_comparison_experiments(
                     "Consider running sequentially or using CPU for parallel execution.",
                     UserWarning,
                 )
-            proposed_result = run_proposed_experiment(
-                series, proposed_config, train_ratio, device
-            )
-            control_result = run_control_experiment(
-                series, ctrl_config, train_ratio, device
-            )
+            proposed_result = run_proposed_exp_and_update_progress(proposed_config)
+            control_result = run_control_exp_and_update_progress()
 
         return proposed_result, control_result
 
@@ -649,14 +667,12 @@ def run_comparison_experiments(
                 proposed_futures = []
                 for config in proposed_config:
                     future = executor.submit(
-                        run_proposed_experiment, series, config, train_ratio, device
+                        run_proposed_exp_and_update_progress, config
                     )
                     proposed_futures.append(future)
 
                 # Submit control experiment
-                control_future = executor.submit(
-                    run_control_experiment, series, ctrl_config, train_ratio, device
-                )
+                control_future = executor.submit(run_control_exp_and_update_progress)
 
                 # Collect results in order
                 proposed_results = []
@@ -675,12 +691,10 @@ def run_comparison_experiments(
 
             proposed_results = []
             for config in proposed_config:
-                result = run_proposed_experiment(series, config, train_ratio, device)
+                result = run_proposed_exp_and_update_progress(config)
                 proposed_results.append(result)
 
-            control_result = run_control_experiment(
-                series, ctrl_config, train_ratio, device
-            )
+            control_result = run_control_exp_and_update_progress()
 
         return proposed_results, control_result
 
