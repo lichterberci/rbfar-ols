@@ -28,7 +28,8 @@ def test_types_and_shapes_torch_and_numpy():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.randperm(l)[:m]
-    P = f(X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
+    centres = X[cand]  # Convert indices to actual centres
+    P = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
     assert isinstance(P, torch.Tensor)
     assert P.shape == (l, m * n)
 
@@ -37,9 +38,8 @@ def test_types_and_shapes_torch_and_numpy():
     Xn = rng.standard_normal((l, n))  # float64
     dn = rng.standard_normal(l)
     candn = np.arange(m, dtype=np.int64)
-    Pn = f(
-        Xn, dn, candidate_indices=candn, radial_basis_function=RBF.GAUSSIAN, sigma=1.0
-    )
+    centres_n = Xn[candn]  # Convert indices to actual centres
+    Pn = f(Xn, dn, centres=centres_n, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
     assert isinstance(Pn, np.ndarray)
     assert Pn.shape == (l, m * n)
     assert Pn.dtype in (np.float32, np.float64)
@@ -55,8 +55,9 @@ def test_gaussian_with_large_sigma_replicates_X_blocks():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.arange(m)
+    centres = X[cand]  # Convert indices to actual centres
     # Very large sigma -> phi ~ 1, so P should be [X | X | ... | X]
-    P = f(X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=1e9)
+    P = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=1e9)
     expected = torch.cat([X] * m, dim=1)
     assert torch.allclose(P, expected, rtol=1e-6, atol=1e-6)
 
@@ -71,13 +72,10 @@ def test_laplacian_differs_from_gaussian_for_finite_sigma():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.randperm(l)[:m]
+    centres = X[cand]  # Convert indices to actual centres
     sigma = 0.5
-    P_g = f(
-        X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=sigma
-    )
-    P_l = f(
-        X, d, candidate_indices=cand, radial_basis_function=RBF.LAPLACIAN, sigma=sigma
-    )
+    P_g = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=sigma)
+    P_l = f(X, d, centres=centres, radial_basis_function=RBF.LAPLACIAN, sigma=sigma)
     assert not torch.allclose(P_g, P_l)
 
 
@@ -91,7 +89,8 @@ def test_sigma_heuristic_returns_finite_values():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.randperm(l)[:m]
-    P = f(X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=None)
+    centres = X[cand]  # Convert indices to actual centres
+    P = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=None)
     assert torch.isfinite(P).all()
 
 
@@ -104,8 +103,8 @@ def test_local_pretraining_types_and_shapes():
     torch.manual_seed(4)
     X = torch.randn(l, n)
     d = torch.randn(l)
-    cand = torch.randperm(l)[:m]
-    P = f(X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
+    centres = X[torch.randperm(l)[:m]]
+    P = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
     assert isinstance(P, torch.Tensor)
     assert P.shape == (l, m)
 
@@ -121,11 +120,12 @@ def test_local_pretraining_large_sigma_columns_equal_to_ridge_prediction():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.arange(m)
+    centres = X[cand]  # Convert indices to actual centres
     # With very large sigma, all weights ~1 -> same local model for all centres
     P = f(
         X,
         d,
-        candidate_indices=cand,
+        centres=centres,
         radial_basis_function=RBF.GAUSSIAN,
         sigma=1e9,
         ridge=ridge,
@@ -150,13 +150,10 @@ def test_local_pretraining_laplacian_differs_from_gaussian():
     X = torch.randn(l, n)
     d = torch.randn(l)
     cand = torch.randperm(l)[:m]
+    centres = X[cand]  # Convert indices to actual centres
     sigma = 0.7
-    P_g = f(
-        X, d, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=sigma
-    )
-    P_l = f(
-        X, d, candidate_indices=cand, radial_basis_function=RBF.LAPLACIAN, sigma=sigma
-    )
+    P_g = f(X, d, centres=centres, radial_basis_function=RBF.GAUSSIAN, sigma=sigma)
+    P_l = f(X, d, centres=centres, radial_basis_function=RBF.LAPLACIAN, sigma=sigma)
     assert not torch.allclose(P_g, P_l)
 
 
@@ -170,8 +167,7 @@ def test_local_pretraining_numpy_inputs():
     Xn = rng.standard_normal((l, n))
     dn = rng.standard_normal(l)
     cand = np.arange(m)
-    Pn = f(
-        Xn, dn, candidate_indices=cand, radial_basis_function=RBF.GAUSSIAN, sigma=1.0
-    )
+    centres_n = Xn[cand]  # Convert indices to actual centres
+    Pn = f(Xn, dn, centres=centres_n, radial_basis_function=RBF.GAUSSIAN, sigma=1.0)
     assert isinstance(Pn, np.ndarray)
     assert Pn.shape == (l, m)

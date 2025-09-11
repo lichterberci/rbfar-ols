@@ -225,19 +225,51 @@ def run_proposed_experiment(
 
     # Construct design matrix
     if config.approach == "local_pretraining":
-        P_train, P_test, _ = construct_design_matrix_with_local_pretraining(
+        # Select candidate centres as in notebook
+        train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
+            : min(config.m, X_train.shape[0])
+        ]
+        centres = X_train[train_candidates]
+
+        # Construct P_train with local pretraining
+        P_train, nu_hat_train = construct_design_matrix_with_local_pretraining(
             X_train.numpy(),
+            d_train.numpy(),
+            centres=centres.numpy(),
+            sigma=sigma_val,
+            radial_basis_function=config.rbf,
+            ridge=config.ridge,
+            rho=config.rho,
+            return_weights=True,
+        )
+
+        # Construct P_test using the same centres and learned weights
+        P_test = construct_design_matrix_with_local_pretraining(
             X_test.numpy(),
-            config.m,
-            sigma_val,
-            config.rbf,
-            config.ridge,
-            config.rho,
+            d_test.numpy(),  # Not used when weights are provided
+            centres=centres.numpy(),
+            weights=nu_hat_train,
+            sigma=sigma_val,
+            radial_basis_function=config.rbf,
+            return_weights=False,
         )
+
     else:  # no_pretraining
-        P_train, P_test, _ = construct_design_matrix_with_no_pretraining(
-            X_train.numpy(), X_test.numpy(), config.m, sigma_val, config.rbf
+        # Use stacked approach as in notebook
+        train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
+            : min(config.m, X_train.shape[0])
+        ]
+        lt = X_test.shape[0]
+        X_stack = torch.cat([X_test, X_train], dim=0)
+        d_stack = torch.zeros(X_stack.shape[0], dtype=X_stack.dtype)
+        P_stack = construct_design_matrix_with_no_pretraining(
+            X_stack.numpy(),
+            d_stack.numpy(),
+            centres=X_train[train_candidates].numpy(),
+            sigma=sigma_val,
+            radial_basis_function=config.rbf,
         )
+        P_train, P_test = P_stack[lt:], P_stack[:lt]
 
     P_train = torch.from_numpy(P_train).to(device)
     P_test = torch.from_numpy(P_test).to(device)

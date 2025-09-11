@@ -41,7 +41,7 @@ def example_separate_configs():
 
     # Generate test time series
     series = make_synthetic_series()
-    print(f"Generated time series with {len(series)} points")
+    print(f"Generated time series with {series.shape} shape")
 
     # Create proposed method configuration
     proposed_config = ProposedMethodConfig(

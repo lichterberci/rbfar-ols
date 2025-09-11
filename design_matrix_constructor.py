@@ -74,16 +74,16 @@ def estimate_sigma_median(
 def construct_design_matrix_with_no_pretraining(
     X: torch.Tensor | np.ndarray,
     d: torch.Tensor | np.ndarray,
-    candidate_indices: Optional[torch.Tensor | np.ndarray] = None,
+    centres: Optional[torch.Tensor | np.ndarray] = None,
     radial_basis_function: RadialBasisFunction = RadialBasisFunction.GAUSSIAN,
     sigma: Optional[float | int | torch.Tensor | np.ndarray] = None,
 ):
     """Build the design matrix P for the "second approach" (no pre-training).
 
-    Given samples X in R^{l x n} and a set of candidate centres C selected from
-    the rows of X, compute the activation matrix Phi (l x m) using an RBF, then
-    construct P in R^{l x (m*n)} where each group of n columns corresponds to a
-    centre and equals Phi[:, j] element-wise multiplied by each column of X.
+    Given samples X in R^{l x n} and a set of centres C, compute the activation
+    matrix Phi (l x m) using an RBF, then construct P in R^{l x (m*n)} where each
+    group of n columns corresponds to a centre and equals Phi[:, j] element-wise
+    multiplied by each column of X.
 
     Specifically, using 1-based indexing in the documentation's notation:
         P_{i, (j-1)*n + k} = Phi_{i, j} * X_{i, k}
@@ -91,8 +91,8 @@ def construct_design_matrix_with_no_pretraining(
     Args:
         X: Input matrix of shape (l, n). Torch tensor or NumPy array.
         d: Target vector of shape (l,). Not used here; kept for interface parity.
-        candidate_indices: Optional 1D indices selecting rows of X as centres.
-            If None, all l rows are used as candidate centres (m = l).
+        centres: Optional matrix of shape (m, n) containing centre points.
+            If None, all l rows of X are used as centres (m = l).
         radial_basis_function: Choice of RBF (Gaussian or Laplacian).
 
     Returns:
@@ -147,23 +147,21 @@ def construct_design_matrix_with_no_pretraining(
     if d_t.shape[0] != l:
         raise ValueError("X and d must have compatible first dimension (l)")
 
-    # Determine candidate centres
-    if candidate_indices is None:
-        centres_idx_t = torch.arange(l, device=device, dtype=torch.long)
+    # Determine centres
+    if centres is None:
+        centres = X_t  # Use all rows of X as centres
     else:
-        if isinstance(candidate_indices, np.ndarray):
-            centres_idx_t = torch.from_numpy(candidate_indices).to(device=device)
+        if isinstance(centres, np.ndarray):
+            centres = torch.from_numpy(centres).to(device=device, dtype=dtype)
         else:
-            centres_idx_t = candidate_indices.to(device=device)
-        if centres_idx_t.ndim != 1:
-            raise ValueError("candidate_indices must be a 1D array of indices")
-        centres_idx_t = centres_idx_t.to(dtype=torch.long)
-        if centres_idx_t.numel() == 0:
-            raise ValueError("candidate_indices must be non-empty")
-        if centres_idx_t.min() < 0 or centres_idx_t.max() >= l:
-            raise IndexError("candidate_indices out of bounds for rows of X")
+            centres = centres.to(device=device, dtype=dtype)
+        if centres.ndim != 2:
+            raise ValueError("centres must be a 2D array (m, n)")
+        if centres.shape[1] != n:
+            raise ValueError("centres must have same number of columns as X")
+        if centres.shape[0] == 0:
+            raise ValueError("centres must be non-empty")
 
-    centres = X_t[centres_idx_t]  # (m, n)
     m = centres.shape[0]
 
     # Compute pairwise distances between all samples and centres efficiently
@@ -178,7 +176,22 @@ def construct_design_matrix_with_no_pretraining(
     # Bandwidth sigma: use provided value if any, otherwise median heuristic
     sigma_t: torch.Tensor
     if sigma is None:
-        sigma_t = estimate_sigma_median(X_t, candidate_indices)
+        # For sigma estimation, we'll compute distances between X and centres directly
+        x_sq_sigma = (X_t * X_t).sum(dim=1, keepdim=True)
+        centres_sq_sigma = (centres * centres).sum(dim=1)
+        dist_sq_sigma = (x_sq_sigma + centres_sq_sigma.unsqueeze(0)) - 2.0 * (
+            X_t @ centres.transpose(0, 1)
+        )
+        dist_sq_sigma = torch.clamp(dist_sq_sigma, min=0.0)
+        nonzero_dist_sq = dist_sq_sigma[dist_sq_sigma > 0]
+
+        if nonzero_dist_sq.numel() == 0:
+            sigma_t = torch.tensor(1.0, device=device, dtype=dtype)
+        else:
+            sigma_t = torch.median(torch.sqrt(nonzero_dist_sq + 1e-12))
+            if not torch.isfinite(sigma_t):
+                sigma_t = torch.tensor(1.0, device=device, dtype=dtype)
+        sigma_t = torch.clamp(sigma_t, min=torch.finfo(dtype).eps)
     else:
         # Accept Python scalar, NumPy scalar/array (0-d), or torch scalar
         if isinstance(sigma, torch.Tensor):
@@ -229,7 +242,8 @@ def construct_design_matrix_with_no_pretraining(
 def construct_design_matrix_with_local_pretraining(
     X: torch.Tensor | np.ndarray,
     d: torch.Tensor | np.ndarray,
-    candidate_indices: Optional[torch.Tensor | np.ndarray] = None,
+    centres: torch.Tensor | np.ndarray,
+    weights: Optional[torch.Tensor | np.ndarray] = None,
     radial_basis_function: RadialBasisFunction = RadialBasisFunction.GAUSSIAN,
     sigma: Optional[float | int | torch.Tensor | np.ndarray] = None,
     ridge: float = 1e-8,
@@ -249,7 +263,9 @@ def construct_design_matrix_with_local_pretraining(
     Args:
         X: Input matrix of shape (l, n).
         d: Target vector of shape (l,).
-        candidate_indices: Optional indices selecting rows of X as centres.
+        centres: Centre matrix of shape (m, n). These centres are used directly.
+        weights: Optional pre-computed weights of shape (m, n). If provided, skips local training
+            and uses these weights to construct P directly (useful for test set construction).
         radial_basis_function: RBF type used to build phi.
         sigma: Optional bandwidth; if None, median-heuristic is used.
         ridge: Small non-negative Tikhonov regularization to stabilize WLS.
@@ -259,6 +275,7 @@ def construct_design_matrix_with_local_pretraining(
 
     Returns:
         P with shape (l, m), same array/tensor type as X.
+        If return_weights=True, returns (P, weights) tuple.
     """
     if not isinstance(X, (torch.Tensor, np.ndarray)):
         raise TypeError("X must be a torch.Tensor or numpy.ndarray")
@@ -298,34 +315,29 @@ def construct_design_matrix_with_local_pretraining(
     if d_t.shape[0] != l:
         raise ValueError("X and d must have compatible first dimension (l)")
 
-    # Candidate centres
-    if candidate_indices is None:
-        centres_idx_t = torch.arange(l, device=device, dtype=torch.long)
+    # Determine centres
+    if isinstance(centres, np.ndarray):
+        centres_t = torch.from_numpy(centres).to(device=device, dtype=dtype)
     else:
-        if isinstance(candidate_indices, np.ndarray):
-            centres_idx_t = torch.from_numpy(candidate_indices).to(device=device)
-        else:
-            centres_idx_t = candidate_indices.to(device=device)
-        if centres_idx_t.ndim != 1:
-            raise ValueError("candidate_indices must be a 1D array of indices")
-        centres_idx_t = centres_idx_t.to(dtype=torch.long)
-        if centres_idx_t.numel() == 0:
-            raise ValueError("candidate_indices must be non-empty")
-        if centres_idx_t.min() < 0 or centres_idx_t.max() >= l:
-            raise IndexError("candidate_indices out of bounds for rows of X")
-
-    centres = X_t[centres_idx_t]  # (m, n)
-    m = centres.shape[0]
+        centres_t = centres.to(device=device, dtype=dtype)
+    if centres_t.ndim != 2:
+        raise ValueError("centres must be 2D (m, n)")
+    if centres_t.shape[1] != n:
+        raise ValueError("centres must have same number of features as X")
+    m = centres_t.shape[0]
 
     # Distances
     x_sq = (X_t * X_t).sum(dim=1, keepdim=True)
-    centres_sq = (centres * centres).sum(dim=1)
-    dist_sq = (x_sq + centres_sq.unsqueeze(0)) - 2.0 * (X_t @ centres.transpose(0, 1))
+    centres_sq = (centres_t * centres_t).sum(dim=1)
+    dist_sq = (x_sq + centres_sq.unsqueeze(0)) - 2.0 * (X_t @ centres_t.transpose(0, 1))
     dist_sq = torch.clamp(dist_sq, min=0.0)
 
     # Sigma
     if sigma is None:
-        sigma_t = estimate_sigma_median(X_t, candidate_indices)
+        # Use centres for sigma estimation
+        sigma_t = estimate_sigma_median(
+            X_t, None
+        )  # Use all points for sigma estimation
     else:
         if isinstance(sigma, torch.Tensor):
             if sigma.numel() != 1:
@@ -358,28 +370,48 @@ def construct_design_matrix_with_local_pretraining(
     if ridge < 0:
         raise ValueError("ridge must be non-negative")
 
-    eye = torch.eye(n, device=device, dtype=dtype)
-    P = torch.zeros((l, m), device=device, dtype=dtype)
-    # Vectorized computation to replace the loop
-    Xi_mask = torch.where(
-        phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
-    )  # (l, m)
-    X_masked_out = Xi_mask.unsqueeze(-1) * X_t.unsqueeze(1)  # (l, m, n)
-    a = torch.einsum("lmi, lj -> mij", X_masked_out, X_t) + ridge * eye.unsqueeze(
-        0
-    )  # (m, n, n)
-    b = torch.einsum("lmi, l -> mi", X_masked_out, d_t)  # (m, n)
-    nu_hat = torch.linalg.solve(a, b)  # (m, n)
-    P = phi * (X_t @ nu_hat.T)  # (l, m)
+    # If weights are provided, use them directly to construct P (useful for test set)
+    if weights is not None:
+        if isinstance(weights, np.ndarray):
+            weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
+        else:
+            weights_t = weights.to(device=device, dtype=dtype)
+        if weights_t.shape != (m, n):
+            raise ValueError(f"weights must have shape (m, n) = ({m}, {n})")
+        P = phi * (X_t @ weights_t.T)  # (l, m)
+    else:
+        # Compute weights through local training
+        eye = torch.eye(n, device=device, dtype=dtype)
+        # Vectorized computation to replace the loop
+        Xi_mask = torch.where(
+            phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
+        )  # (l, m)
+        X_masked_out = Xi_mask.unsqueeze(-1) * X_t.unsqueeze(1)  # (l, m, n)
+        a = torch.einsum("lmi, lj -> mij", X_masked_out, X_t) + ridge * eye.unsqueeze(
+            0
+        )  # (m, n, n)
+        b = torch.einsum("lmi, l -> mi", X_masked_out, d_t)  # (m, n)
+        nu_hat = torch.linalg.solve(a, b)  # (m, n)
+        P = phi * (X_t @ nu_hat.T)  # (l, m)
 
     if return_numpy:
         np_dtype = np.float64 if dtype == torch.float64 else np.float32
-        return (
-            P.cpu().numpy().astype(np_dtype, copy=False)
-            if not return_weights
-            else (
-                P.cpu().numpy().astype(np_dtype, copy=False),
-                nu_hat.cpu().numpy().astype(np_dtype, copy=False),
-            )
-        )
-    return P if not return_weights else (P, nu_hat)
+        P_numpy = P.cpu().numpy().astype(np_dtype, copy=False)
+        if return_weights:
+            if weights is not None:
+                # Return the provided weights
+                weights_numpy = weights_t.cpu().numpy().astype(np_dtype, copy=False)
+            else:
+                # Return the computed weights
+                weights_numpy = nu_hat.cpu().numpy().astype(np_dtype, copy=False)
+            return P_numpy, weights_numpy
+        return P_numpy
+    else:
+        if return_weights:
+            if weights is not None:
+                # Return the provided weights
+                return P, weights_t
+            else:
+                # Return the computed weights
+                return P, nu_hat
+        return P
