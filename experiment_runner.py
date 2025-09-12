@@ -16,7 +16,11 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import multiprocessing
 import os
-
+from dimension_estimation import (
+    CaoEstimator,
+    OptimalDimensionSelectionMethod,
+    estimate_dimension,
+)
 from design_matrix_constructor import (
     RadialBasisFunction,
     estimate_sigma_median,
@@ -26,6 +30,11 @@ from design_matrix_constructor import (
 from ols_optimizer import OlsOptimizer
 from svd_based_optimizer import SvdOptimizer
 from optimizer import Optimizer
+from lag_estimation import (
+    estimate_tau,
+    AmiEstimator,
+    OptimalLagSelectionMethod,
+)
 
 
 @dataclass
@@ -48,6 +57,7 @@ class ExperimentConfig:
 
     # RBF parameters
     n: Optional[int] = None  # AR order (features per row), None for auto-estimation
+    embedding_tau: Optional[int] = None  # Time delay (tau), None for auto-estimation
     sigma: Optional[float] = None  # None -> heuristic estimation
     rbf: RadialBasisFunction = RadialBasisFunction.GAUSSIAN
 
@@ -97,61 +107,18 @@ class ControlConfig(ExperimentConfig):
     val_split: float = 0.1  # validation split ratio
 
 
-def estimate_embedding_dimension_cao(y: np.ndarray, max_m: int = 20) -> int:
+def estimate_embedding_dimension_cao(y: np.ndarray, tau, max_m: int = 20) -> int:
     """Estimate embedding dimension using Cao's method."""
-    y = np.asarray(y, dtype=np.float64)
-    l = len(y)
-    e1_values = []
 
-    for m in range(1, max_m + 1):
-        if l - m <= 0:
-            break
-
-        # Create delay vectors
-        X_m = np.stack([y[i : l - m + i + 1] for i in range(m)], axis=1)
-        X_m1 = np.stack([y[i : l - m + i] for i in range(m + 1)], axis=1)
-
-        if X_m.shape[0] == 0 or X_m1.shape[0] == 0:
-            break
-
-        # Build KDTree for efficient nearest neighbor search
-        tree_m = KDTree(X_m)
-
-        total_ratio = 0.0
-        valid_points = 0
-
-        for i in range(len(X_m1) - 1):
-            # Find nearest neighbor in m-dimensional space
-            dist_m, idx_m = tree_m.query(X_m[i], k=2)
-            if len(dist_m) < 2 or dist_m[1] == 0:
-                continue
-
-            nn_idx = idx_m[1]  # Skip self (index 0)
-
-            # Calculate distances in (m+1)-dimensional space
-            if nn_idx < len(X_m1) - 1:
-                dist_m1 = np.linalg.norm(X_m1[i] - X_m1[nn_idx])
-                if dist_m[1] > 0:
-                    total_ratio += dist_m1 / dist_m[1]
-                    valid_points += 1
-
-        if valid_points > 0:
-            e1 = total_ratio / valid_points
-            e1_values.append(e1)
-        else:
-            e1_values.append(float("inf"))
-
-    if not e1_values:
-        return 3  # Default fallback
-
-    # Find dimension where E1 stops changing significantly
-    for i in range(1, len(e1_values)):
-        if len(e1_values) > i and e1_values[i - 1] != 0:
-            ratio = abs(e1_values[i] - e1_values[i - 1]) / abs(e1_values[i - 1])
-            if ratio < 0.1:  # Less than 10% change
-                return i + 1
-
-    return min(len(e1_values) + 1, max_m)
+    estimator = CaoEstimator(
+        delay=tau,
+        max_dim=max_m,
+        optimum_selection_method=OptimalDimensionSelectionMethod.E1_E2_COMBINED,
+        plot=False,
+        verbose=False,
+    )
+    dim = estimate_dimension(y, estimator)
+    return dim
 
 
 def make_lagged_matrix(
@@ -159,23 +126,28 @@ def make_lagged_matrix(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Create lagged feature matrix and target vector."""
     l = len(y)
-    X = np.stack([y[i : l - n * tau + i] for i in range(0, n * tau, tau)], axis=1)
-    d = y[n * tau :]
+
+    num_rows = l - n * tau
+    if num_rows <= 0:
+        raise ValueError("Not enough data for embedding with given n and tau.")
+
+    # Construct the lagged matrix by iterating over dimensions (columns)
+    X = np.column_stack([y[j * tau : j * tau + num_rows] for j in range(n)])
+
+    # Target vector is the next value after the embedding
+    d = y[n * tau : n * tau + num_rows]
+
     return X, d
 
 
-def estimate_tau_from_autocorr(y: np.ndarray) -> int:
-    """Estimate tau (delay) from autocorrelation."""
-    autocorr_full = signal.correlate(y, y, mode="full")
-    lags_full = signal.correlation_lags(len(y), len(y), mode="full")
-
-    # Focus on positive lags
-    autocorr = autocorr_full[len(y) - 1 :] / autocorr_full[len(y) - 1]
-    lags = lags_full[len(y) - 1 :]
-
-    # Set tau to the lag of the maximum autocorrelation (excluding lag 0)
-    tau = lags[np.argmax(autocorr[1:]) + 1] if len(autocorr) > 1 else 1
-    return max(1, int(tau))
+def estimate_tau_for_series(y: np.ndarray) -> int:
+    return estimate_tau(
+        y,
+        AmiEstimator(
+            max_lag=100,
+            optimum_selection_method=OptimalLagSelectionMethod.FIRST_LOC_MIN,
+        ),
+    )
 
 
 def run_proposed_experiment(
@@ -199,12 +171,17 @@ def run_proposed_experiment(
     series = series.astype(np.float32)
 
     # Estimate tau from autocorrelation
-    tau = estimate_tau_from_autocorr(series)
+    if config.embedding_tau is not None:
+        tau = config.embedding_tau
+    else:
+        tau = estimate_tau_for_series(series)
 
     # Estimate embedding dimension if not provided
     n = config.n
     if n is None:
-        n = estimate_embedding_dimension_cao(series, config.max_embedding_dim)
+        n = estimate_embedding_dimension_cao(
+            series, tau=tau, max_m=config.max_embedding_dim
+        )
 
     # Create lagged matrix
     X, d = make_lagged_matrix(series, n, tau)
@@ -227,7 +204,6 @@ def run_proposed_experiment(
 
     # Construct design matrix
     if config.approach == "local_pretraining":
-        # Select candidate centres as in notebook
         train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
             : min(config.m, X_train.shape[0])
         ]
@@ -247,9 +223,9 @@ def run_proposed_experiment(
 
         # Construct P_test using the same centres and learned weights
         P_test = construct_design_matrix_with_local_pretraining(
-            X_test.numpy(),
-            d_test.numpy(),  # Not used when weights are provided
-            centres=centres.numpy(),
+            X_test,
+            d_test,  # Not used when weights are provided
+            centres=centres,
             weights=nu_hat_train,
             sigma=sigma_val,
             radial_basis_function=config.rbf,
@@ -261,27 +237,26 @@ def run_proposed_experiment(
         train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
             : min(config.m, X_train.shape[0])
         ]
-        lt = X_test.shape[0]
-        X_stack = torch.cat([X_test, X_train], dim=0)
-        d_stack = torch.zeros(X_stack.shape[0], dtype=X_stack.dtype)
+        if train_candidates.shape[0] == 0:
+            raise ValueError("Not enough training samples to select centres.")
+        centers = X_train[train_candidates]
+        lt = X_test.shape[0]  # length of test set
         P_stack = construct_design_matrix_with_no_pretraining(
-            X_stack.numpy(),
-            d_stack.numpy(),
-            centres=X_train[train_candidates].numpy(),
+            torch.cat([X_test, X_train], dim=0),
+            torch.cat([d_test, d_train], dim=0),
+            centres=centers,
             sigma=sigma_val,
             radial_basis_function=config.rbf,
         )
         P_train, P_test = P_stack[lt:], P_stack[:lt]
 
-    P_train = torch.from_numpy(P_train).to(device)
-    P_test = torch.from_numpy(P_test).to(device)
-
     # Optimize weights
-    sel_idx, model_weights = config.optimizer.optimize(P_train, d_train)
+    sel_center_idxs, model_weights = config.optimizer.optimize(P_train, d_train)
 
     # Post-tuning if enabled
     weights = model_weights.clone()
-    if config.post_tune and len(sel_idx) > 0:
+
+    if config.post_tune and len(sel_center_idxs) > 0:
         weights = weights.clone().detach().requires_grad_(True)
 
         # Post-tune the selected weights using Adam with early stopping
@@ -291,7 +266,7 @@ def run_proposed_experiment(
         patience_counter = 0
 
         for _ in range(config.tuning_max_epochs):
-            pred = P_train[:, sel_idx] @ weights
+            pred = P_train[:, sel_center_idxs] @ weights
             loss = torch.mean((pred - d_train) ** 2)
 
             optim.zero_grad()
@@ -309,14 +284,14 @@ def run_proposed_experiment(
 
     # Generate predictions
     with torch.no_grad():
-        train_pred = (P_train[:, sel_idx] @ weights).detach().cpu().numpy()
-        test_pred = (P_test[:, sel_idx] @ weights).detach().cpu().numpy()
+        train_pred = (P_train[:, sel_center_idxs] @ weights).detach().cpu().numpy()
+        test_pred = (P_test[:, sel_center_idxs] @ weights).detach().cpu().numpy()
 
     metadata = {
         "tau": tau,
         "n": n,
         "sigma": sigma_val,
-        "selected_centers": len(sel_idx),
+        "selected_centers": len(sel_center_idxs),
         "total_centers": config.m,
         "approach": config.approach,
         "optimizer_type": type(config.optimizer).__name__,
@@ -355,12 +330,17 @@ def run_control_experiment(
     series = series.astype(np.float32)
 
     # Estimate tau from autocorrelation
-    tau = estimate_tau_from_autocorr(series)
+    if config.embedding_tau is not None:
+        tau = config.embedding_tau
+    else:
+        tau = estimate_tau_for_series(series)
 
     # Estimate embedding dimension if not provided
     n = config.n
     if n is None:
-        n = estimate_embedding_dimension_cao(series, config.max_embedding_dim)
+        n = estimate_embedding_dimension_cao(
+            series, tau=tau, max_m=config.max_embedding_dim
+        )
 
     # Create lagged matrix
     X, d = make_lagged_matrix(series, n, tau)
