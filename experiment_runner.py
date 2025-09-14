@@ -560,28 +560,33 @@ def create_default_control_config(**kwargs) -> ControlConfig:
 def run_comparison_experiments(
     series: np.ndarray,
     proposed_config: Union[ProposedMethodConfig, List[ProposedMethodConfig]],
-    ctrl_config: Optional[ControlConfig] = None,
+    ctrl_config: Optional[Union[ControlConfig, List[ControlConfig]]] = None,
     train_ratio: float = 0.7,
     device: str = "cpu",
     run_parallel: bool = False,
     show_progress: bool = True,
-) -> Tuple[Union[ExperimentResult, List[ExperimentResult]], ExperimentResult]:
+) -> Tuple[
+    Union[ExperimentResult, List[ExperimentResult]],
+    Union[ExperimentResult, List[ExperimentResult]],
+]:
     """
     Run proposed method(s) and control experiments for comparison.
 
     Args:
         series: Time series data
         proposed_config: Configuration(s) for proposed method(s)
-        ctrl_config: Configuration for control method (uses default if None)
+        ctrl_config: Configuration(s) for control method(s) (uses default if None)
         train_ratio: Training data ratio
         device: Device to run on (for GPU parallelism, use "cuda" but see notes below)
         run_parallel: If True, run experiments in parallel; if False, run sequentially
         show_progress: If True, show progress bars during lag estimation
 
     Returns:
-        Tuple of (proposed_result(s), control_result)
-        - If single config: (ExperimentResult, ExperimentResult)
-        - If multiple configs: (List[ExperimentResult], ExperimentResult)
+        Tuple of (proposed_result(s), control_result(s))
+        - If single configs: (ExperimentResult, ExperimentResult)
+        - If single proposed, multiple control: (ExperimentResult, List[ExperimentResult])
+        - If multiple proposed, single control: (List[ExperimentResult], ExperimentResult)
+        - If multiple configs: (List[ExperimentResult], List[ExperimentResult])
 
     Notes on Parallelism:
         - CPU device: True parallelism with ThreadPoolExecutor
@@ -594,12 +599,13 @@ def run_comparison_experiments(
     if ctrl_config is None:
         ctrl_config = create_default_control_config()
 
+    # Calculate total number of experiments for progress bar
+    num_proposed = len(proposed_config) if isinstance(proposed_config, list) else 1
+    num_control = len(ctrl_config) if isinstance(ctrl_config, list) else 1
+    total_experiments = num_proposed + num_control
+
     progress_bar = tqdm(
-        (
-            range(len(proposed_config) + 1)
-            if isinstance(proposed_config, list)
-            else range(2)
-        ),
+        range(total_experiments),
         disable=not show_progress,
         desc="Running Experiments",
         unit="experiment",
@@ -609,76 +615,78 @@ def run_comparison_experiments(
         progress_bar.update(1),
         run_proposed_experiment(series, cfg, train_ratio, device),
     )[1]
-    run_control_exp_and_update_progress = lambda: (
+    run_control_exp_and_update_progress = lambda cfg: (
         progress_bar.update(1),
-        run_control_experiment(series, ctrl_config, train_ratio, device),
+        run_control_experiment(series, cfg, train_ratio, device),
     )[1]
-    # Handle single config case
-    if isinstance(proposed_config, ProposedMethodConfig):
-        if run_parallel and device == "cpu":
-            # True parallelism only beneficial on CPU
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                proposed_future = executor.submit(
-                    run_proposed_exp_and_update_progress, proposed_config
-                )
-                control_future = executor.submit(run_control_exp_and_update_progress)
+    # Determine config types
+    proposed_is_single = isinstance(proposed_config, ProposedMethodConfig)
+    proposed_is_multiple = isinstance(proposed_config, list)
+    control_is_single = isinstance(ctrl_config, ControlConfig)
+    control_is_multiple = isinstance(ctrl_config, list)
 
-                proposed_result = proposed_future.result()
-                control_result = control_future.result()
-        else:
-            # Run sequentially (recommended for GPU)
-            if run_parallel and device != "cpu":
-                warnings.warn(
-                    "Parallel execution on GPU may not provide speedup due to CUDA context conflicts. "
-                    "Consider running sequentially or using CPU for parallel execution.",
-                    UserWarning,
-                )
-            proposed_result = run_proposed_exp_and_update_progress(proposed_config)
-            control_result = run_control_exp_and_update_progress()
-
-        return proposed_result, control_result
-
-    # Handle multiple configs case
-    elif isinstance(proposed_config, list):
-        if run_parallel and device == "cpu":
-            # True parallelism only beneficial on CPU
-            with ThreadPoolExecutor(max_workers=len(proposed_config) + 1) as executor:
-                # Submit all proposed method experiments
-                proposed_futures = []
-                for config in proposed_config:
-                    future = executor.submit(
-                        run_proposed_exp_and_update_progress, config
-                    )
-                    proposed_futures.append(future)
-
-                # Submit control experiment
-                control_future = executor.submit(run_control_exp_and_update_progress)
-
-                # Collect results in order
-                proposed_results = []
-                for future in proposed_futures:
-                    proposed_results.append(future.result())
-
-                control_result = control_future.result()
-        else:
-            # Run sequentially (recommended for GPU and fallback)
-            if run_parallel and device != "cpu":
-                warnings.warn(
-                    "Parallel execution on GPU may not provide speedup due to CUDA context conflicts. "
-                    "Running sequentially instead for better GPU utilization.",
-                    UserWarning,
-                )
-
-            proposed_results = []
-            for config in proposed_config:
-                result = run_proposed_exp_and_update_progress(config)
-                proposed_results.append(result)
-
-            control_result = run_control_exp_and_update_progress()
-
-        return proposed_results, control_result
-
-    else:
+    if not (proposed_is_single or proposed_is_multiple):
         raise TypeError(
             "proposed_config must be ProposedMethodConfig or List[ProposedMethodConfig]"
         )
+
+    if not (control_is_single or control_is_multiple):
+        raise TypeError("ctrl_config must be ControlConfig or List[ControlConfig]")
+
+    # Convert single configs to lists for uniform processing
+    proposed_configs = [proposed_config] if proposed_is_single else proposed_config
+    control_configs = [ctrl_config] if control_is_single else ctrl_config
+
+    # Run experiments
+    if run_parallel and device == "cpu":
+        # True parallelism only beneficial on CPU
+        max_workers = len(proposed_configs) + len(control_configs)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all proposed method experiments
+            proposed_futures = []
+            for config in proposed_configs:
+                future = executor.submit(run_proposed_exp_and_update_progress, config)
+                proposed_futures.append(future)
+
+            # Submit all control experiments
+            control_futures = []
+            for config in control_configs:
+                future = executor.submit(run_control_exp_and_update_progress, config)
+                control_futures.append(future)
+
+            # Collect results in order
+            proposed_results = []
+            for future in proposed_futures:
+                proposed_results.append(future.result())
+
+            control_results = []
+            for future in control_futures:
+                control_results.append(future.result())
+    else:
+        # Run sequentially (recommended for GPU and fallback)
+        if run_parallel and device != "cpu":
+            warnings.warn(
+                "Parallel execution on GPU may not provide speedup due to CUDA context conflicts. "
+                "Running sequentially instead for better GPU utilization.",
+                UserWarning,
+            )
+
+        # Run proposed experiments sequentially
+        proposed_results = []
+        for config in proposed_configs:
+            result = run_proposed_exp_and_update_progress(config)
+            proposed_results.append(result)
+
+        # Run control experiments sequentially
+        control_results = []
+        for config in control_configs:
+            result = run_control_exp_and_update_progress(config)
+            control_results.append(result)
+
+    # Convert back to single results if original inputs were single configs
+    final_proposed_results = (
+        proposed_results[0] if proposed_is_single else proposed_results
+    )
+    final_control_results = control_results[0] if control_is_single else control_results
+
+    return final_proposed_results, final_control_results

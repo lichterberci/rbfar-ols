@@ -1,3 +1,8 @@
+"""
+Test module for design matrix constructor functionality.
+"""
+
+import pytest
 import importlib.util
 from pathlib import Path
 
@@ -5,7 +10,9 @@ import numpy as np
 import torch
 
 
-def _load_design_matrix_module():
+@pytest.fixture
+def design_matrix_module():
+    """Load the design matrix constructor module."""
     root = Path(__file__).resolve().parents[1]
     mod_path = root / "design_matrix_constructor.py"
     spec = importlib.util.spec_from_file_location(
@@ -17,8 +24,9 @@ def _load_design_matrix_module():
     return mod
 
 
-def test_types_and_shapes_torch_and_numpy():
-    mod = _load_design_matrix_module()
+def test_types_and_shapes_torch_and_numpy(design_matrix_module):
+    """Test that function handles both torch and numpy inputs correctly."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_no_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -45,8 +53,9 @@ def test_types_and_shapes_torch_and_numpy():
     assert Pn.dtype in (np.float32, np.float64)
 
 
-def test_gaussian_with_large_sigma_replicates_X_blocks():
-    mod = _load_design_matrix_module()
+def test_gaussian_with_large_sigma_replicates_X_blocks(design_matrix_module):
+    """Test that large sigma in Gaussian RBF replicates X blocks."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_no_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -62,8 +71,9 @@ def test_gaussian_with_large_sigma_replicates_X_blocks():
     assert torch.allclose(P, expected, rtol=1e-6, atol=1e-6)
 
 
-def test_laplacian_differs_from_gaussian_for_finite_sigma():
-    mod = _load_design_matrix_module()
+def test_laplacian_differs_from_gaussian_for_finite_sigma(design_matrix_module):
+    """Test that Laplacian RBF produces different results from Gaussian."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_no_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -79,8 +89,9 @@ def test_laplacian_differs_from_gaussian_for_finite_sigma():
     assert not torch.allclose(P_g, P_l)
 
 
-def test_sigma_heuristic_returns_finite_values():
-    mod = _load_design_matrix_module()
+def test_sigma_heuristic_returns_finite_values(design_matrix_module):
+    """Test that automatic sigma estimation returns finite values."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_no_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -94,8 +105,9 @@ def test_sigma_heuristic_returns_finite_values():
     assert torch.isfinite(P).all()
 
 
-def test_local_pretraining_types_and_shapes():
-    mod = _load_design_matrix_module()
+def test_local_pretraining_types_and_shapes(design_matrix_module):
+    """Test basic functionality and shapes for local pretraining."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_local_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -109,8 +121,11 @@ def test_local_pretraining_types_and_shapes():
     assert P.shape == (l, m)
 
 
-def test_local_pretraining_large_sigma_columns_equal_to_ridge_prediction():
-    mod = _load_design_matrix_module()
+def test_local_pretraining_large_sigma_columns_equal_to_ridge_prediction(
+    design_matrix_module,
+):
+    """Test that large sigma in local pretraining produces ridge-like predictions."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_local_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -140,8 +155,9 @@ def test_local_pretraining_large_sigma_columns_equal_to_ridge_prediction():
     assert torch.allclose(P, z.unsqueeze(1).expand(-1, m), rtol=1e-5, atol=1e-5)
 
 
-def test_local_pretraining_laplacian_differs_from_gaussian():
-    mod = _load_design_matrix_module()
+def test_local_pretraining_laplacian_differs_from_gaussian(design_matrix_module):
+    """Test that Laplacian RBF differs from Gaussian in local pretraining."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_local_pretraining
     RBF = mod.RadialBasisFunction
 
@@ -157,8 +173,9 @@ def test_local_pretraining_laplacian_differs_from_gaussian():
     assert not torch.allclose(P_g, P_l)
 
 
-def test_local_pretraining_numpy_inputs():
-    mod = _load_design_matrix_module()
+def test_local_pretraining_numpy_inputs(design_matrix_module):
+    """Test local pretraining function with numpy inputs."""
+    mod = design_matrix_module
     f = mod.construct_design_matrix_with_local_pretraining
     RBF = mod.RadialBasisFunction
 
