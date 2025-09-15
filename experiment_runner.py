@@ -5,36 +5,35 @@ This module provides functionality to run configurable experiments comparing
 SVD/OLS-based methods with a control method (Adam-optimized RBF) on given time series data.
 """
 
+import multiprocessing
+import os
+import warnings
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple, Optional, Union, List
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import torch
-import warnings
+import torch.nn.functional as F
 from scipy import signal
 from scipy.spatial import KDTree
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import multiprocessing
-import os
+
+from design_matrix_constructor import (
+    RadialBasisFunction,
+    construct_design_matrix_with_local_pretraining,
+    construct_design_matrix_with_no_pretraining,
+    estimate_sigma_median,
+)
 from dimension_estimation import (
     CaoEstimator,
     OptimalDimensionSelectionMethod,
     estimate_dimension,
 )
-from design_matrix_constructor import (
-    RadialBasisFunction,
-    estimate_sigma_median,
-    construct_design_matrix_with_local_pretraining,
-    construct_design_matrix_with_no_pretraining,
-)
+from lag_estimation import AmiEstimator, OptimalLagSelectionMethod, estimate_tau
 from ols_optimizer import OlsOptimizer
-from svd_based_optimizer import SvdOptimizer
 from optimizer import Optimizer
-from lag_estimation import (
-    estimate_tau,
-    AmiEstimator,
-    OptimalLagSelectionMethod,
-)
+from svd_based_optimizer import SvdOptimizer
 
 
 @dataclass
@@ -105,6 +104,7 @@ class ControlConfig(ExperimentConfig):
     sigma_global: bool = True  # if False, learn per-centre sigma
     patience: int = 10  # early stopping patience
     val_split: float = 0.1  # validation split ratio
+    ridge: float = 0.0  # L2 regularization (not used in Adam)
 
 
 def estimate_embedding_dimension_cao(y: np.ndarray, tau, max_m: int = 20) -> int:
@@ -202,18 +202,18 @@ def run_proposed_experiment(
     if sigma_val is None:
         sigma_val = estimate_sigma_median(X_train.numpy())
 
-    # Construct design matrix
-    if config.approach == "local_pretraining":
-        train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
-            : min(config.m, X_train.shape[0])
-        ]
-        centres = X_train[train_candidates]
+    train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
+        : min(config.m, X_train.shape[0])
+    ]
+    centers = X_train[train_candidates]
 
+    # Construct design matrix
+    if config.approach in ["local_pretraining", "pretraining"]:
         # Construct P_train with local pretraining
         P_train, nu_hat_train = construct_design_matrix_with_local_pretraining(
-            X_train.numpy(),
-            d_train.numpy(),
-            centres=centres.numpy(),
+            X_train,
+            d_train,
+            centres=centers,
             sigma=sigma_val,
             radial_basis_function=config.rbf,
             ridge=config.ridge,
@@ -221,25 +221,19 @@ def run_proposed_experiment(
             return_weights=True,
         )
 
-        # Construct P_test using the same centres and learned weights
         P_test = construct_design_matrix_with_local_pretraining(
             X_test,
             d_test,  # Not used when weights are provided
-            centres=centres,
-            weights=nu_hat_train,
+            centres=centers,
+            weights=nu_hat_train,  # Use the pretraining weights
             sigma=sigma_val,
             radial_basis_function=config.rbf,
             return_weights=False,
         )
 
     else:  # no_pretraining
-        # Use stacked approach as in notebook
-        train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
-            : min(config.m, X_train.shape[0])
-        ]
         if train_candidates.shape[0] == 0:
             raise ValueError("Not enough training samples to select centres.")
-        centers = X_train[train_candidates]
         lt = X_test.shape[0]  # length of test set
         P_stack = construct_design_matrix_with_no_pretraining(
             torch.cat([X_test, X_train], dim=0),
@@ -249,49 +243,220 @@ def run_proposed_experiment(
             radial_basis_function=config.rbf,
         )
         P_train, P_test = P_stack[lt:], P_stack[:lt]
+        # Store the centers used for RBF construction
 
     # Optimize weights
-    sel_center_idxs, model_weights = config.optimizer.optimize(P_train, d_train)
+    selected_indices, model_weights = config.optimizer.optimize(P_train, d_train)
 
-    # Post-tuning if enabled
-    weights = model_weights.clone()
+    if config.post_tune:
+        if config.approach in ["local_pretraining", "pretraining"]:
+            # For pretraining approach: only tune the weights, not centers or sigma
+            # The weights here are already the final weights for each center
 
-    if config.post_tune and len(sel_center_idxs) > 0:
-        weights = weights.clone().detach().requires_grad_(True)
+            adjustable_weights = model_weights.clone().detach().requires_grad_(True)
 
-        # Post-tune the selected weights using Adam with early stopping
-        optim = torch.optim.Adam([weights], lr=config.tuning_lr)
+            # Post-tune using Adam with early stopping
+            optim = torch.optim.Adam([adjustable_weights], lr=config.tuning_lr)
 
-        best_loss = float("inf")
-        patience_counter = 0
+            best_weights = adjustable_weights.clone()
+            best_loss = float("inf")
+            patience_counter = 0
 
-        for _ in range(config.tuning_max_epochs):
-            pred = P_train[:, sel_center_idxs] @ weights
-            loss = torch.mean((pred - d_train) ** 2)
+            # Split training data for validation
+            train_size = int((1 - config.tuning_val_split) * X_train.shape[0])
+            X_train_for_tuning = X_train[:train_size]
+            X_valid_for_tuning = X_train[train_size:]
+            d_train_for_tuning = d_train[:train_size]
+            d_valid_for_tuning = d_train[train_size:]
 
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
+            # For pretraining, we need to reconstruct the design matrices with the learned weights
+            P_train_for_tuning = construct_design_matrix_with_local_pretraining(
+                X_train_for_tuning,
+                d_train_for_tuning,  # Not used when weights are provided
+                centres=centers,  # Use the correct variable name
+                weights=nu_hat_train,  # Use the pretraining weights
+                sigma=sigma_val,
+                radial_basis_function=config.rbf,
+                return_weights=False,
+            )
+            P_valid_for_tuning = construct_design_matrix_with_local_pretraining(
+                X_valid_for_tuning,
+                d_valid_for_tuning,  # Not used when weights are provided
+                centres=centers,  # Use the correct variable name
+                weights=nu_hat_train,  # Use the pretraining weights
+                sigma=sigma_val,
+                radial_basis_function=config.rbf,
+                return_weights=False,
+            )
 
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                patience_counter = 0
-            else:
-                patience_counter += 1
+            for _ in range(config.tuning_max_epochs):
+                # Training step
+                pred = (P_train_for_tuning @ adjustable_weights).squeeze()
+                loss = torch.mean((pred - d_train_for_tuning) ** 2)
 
-            if patience_counter >= config.tuning_patience:
-                break
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
 
-    # Generate predictions
-    with torch.no_grad():
-        train_pred = (P_train[:, sel_center_idxs] @ weights).detach().cpu().numpy()
-        test_pred = (P_test[:, sel_center_idxs] @ weights).detach().cpu().numpy()
+                # Validation step
+                with torch.no_grad():
+                    val_pred = (P_valid_for_tuning @ adjustable_weights).squeeze()
+                    val_loss = torch.mean((val_pred - d_valid_for_tuning) ** 2)
+
+                # Early stopping based on validation loss
+                if val_loss.item() < best_loss:
+                    best_loss = val_loss.item()
+                    patience_counter = 0
+                    best_weights = adjustable_weights.clone()
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= config.tuning_patience:
+                    break
+
+            # Restore best weights
+            adjustable_weights.data = best_weights.data
+
+            # Generate predictions using tuned weights
+            with torch.no_grad():
+                train_pred = (P_train @ adjustable_weights).squeeze().cpu().numpy()
+                test_pred = (P_test @ adjustable_weights).squeeze().cpu().numpy()
+
+        else:  # no-pretraining approach
+            # For no-pretraining: tune centers, weights, and sigma
+
+            def _phi_from_params(X_in, C, log_sigma):
+                """Compute RBF features from parameters."""
+                x_sq = (X_in * X_in).sum(dim=1, keepdim=True)  # (l, 1)
+                c_sq = (C * C).sum(dim=1)  # (m,)
+                dist_sq = x_sq + c_sq.unsqueeze(0) - 2.0 * (X_in @ C.T)  # (l, m)
+                dist_sq = torch.clamp(dist_sq, min=0.0)
+
+                sigma = F.softplus(log_sigma) + 1e-6
+
+                if config.rbf == RadialBasisFunction.GAUSSIAN:
+                    denom = 2.0 * (sigma * sigma)
+                    phi = torch.exp(-dist_sq / denom)
+                elif config.rbf == RadialBasisFunction.LAPLACIAN:
+                    dist = torch.sqrt(dist_sq + 1e-12)
+                    phi = torch.exp(-dist / (sigma + 1e-12))
+                else:
+                    raise ValueError("Unknown RBF in config")
+
+                return phi
+
+            def _construct_design_matrix(X_in, centers_in, log_sigma):
+                """Construct the full design matrix P (l, m*n) from X and centers."""
+                phi = _phi_from_params(X_in, centers_in, log_sigma)  # (l, m)
+                # P[i, j*n + k] = phi[i, j] * X[i, k]
+                l, n = X_in.shape
+                m = centers_in.shape[0]
+                P = (phi.unsqueeze(-1) * X_in.unsqueeze(1)).reshape(l, m * n)
+                return P
+
+            # Create adjustable parameters - only tune centers, weights, and sigma
+            adjustable_centers = centers.clone().detach().requires_grad_(True)
+
+            # For no-pretraining, we need to create a full weight vector (m*n,)
+            # The optimizer gave us weights only for selected indices
+            m, n = centers.shape[0], X_train.shape[1]
+            full_weights = torch.zeros(m * n, device=device, dtype=model_weights.dtype)
+            full_weights[selected_indices] = model_weights
+            adjustable_weights = full_weights.clone().detach().requires_grad_(True)
+
+            adjustable_log_sigma = torch.tensor(
+                float(np.log(sigma_val) + 1e-6),
+                device=device,
+                dtype=centers.dtype,
+                requires_grad=True,
+            )
+
+            # Post-tune using Adam with early stopping
+            optim = torch.optim.Adam(
+                [adjustable_centers, adjustable_weights, adjustable_log_sigma],
+                lr=config.tuning_lr,
+            )
+
+            best_params = [
+                p.clone()
+                for p in [adjustable_centers, adjustable_weights, adjustable_log_sigma]
+            ]
+            best_loss = float("inf")
+            patience_counter = 0
+
+            # Split training data for validation
+            train_size = int((1 - config.tuning_val_split) * X_train.shape[0])
+            X_train_for_tuning = X_train[:train_size]
+            X_valid_for_tuning = X_train[train_size:]
+            d_train_for_tuning = d_train[:train_size]
+            d_valid_for_tuning = d_train[train_size:]
+
+            for _ in range(config.tuning_max_epochs):
+                # Training step
+                P_tr = _construct_design_matrix(
+                    X_train_for_tuning, adjustable_centers, adjustable_log_sigma
+                )  # (l_tr, m*n)
+                pred = (P_tr @ adjustable_weights).squeeze()  # (l_tr,)
+                loss = torch.mean((pred - d_train_for_tuning) ** 2)
+
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+                # Validation step
+                with torch.no_grad():
+                    P_val = _construct_design_matrix(
+                        X_valid_for_tuning, adjustable_centers, adjustable_log_sigma
+                    )  # (l_val, m*n)
+                    val_pred = (P_val @ adjustable_weights).squeeze()  # (l_val,)
+                    val_loss = torch.mean((val_pred - d_valid_for_tuning) ** 2)
+
+                # Early stopping based on validation loss
+                if val_loss.item() < best_loss:
+                    best_loss = val_loss.item()
+                    patience_counter = 0
+                    best_params = [
+                        p.clone()
+                        for p in [
+                            adjustable_centers,
+                            adjustable_weights,
+                            adjustable_log_sigma,
+                        ]
+                    ]
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= config.tuning_patience:
+                    break
+
+            # Restore best parameters
+            for i, p in enumerate(
+                [adjustable_centers, adjustable_weights, adjustable_log_sigma]
+            ):
+                p.data = best_params[i].data
+
+            # Generate predictions using tuned parameters
+            with torch.no_grad():
+                # Training predictions
+                P_tr = _construct_design_matrix(
+                    X_train, adjustable_centers, adjustable_log_sigma
+                )  # (l_tr, m*n)
+                train_pred = (P_tr @ adjustable_weights).squeeze().cpu().numpy()
+
+                # Test predictions
+                P_te = _construct_design_matrix(
+                    X_test, adjustable_centers, adjustable_log_sigma
+                )  # (l_te, m*n)
+                test_pred = (P_te @ adjustable_weights).squeeze().cpu().numpy()
+    else:  # no post-tuning
+        train_pred = (P_train @ model_weights).squeeze().cpu().numpy()
+        test_pred = (P_test @ model_weights).squeeze().cpu().numpy()
 
     metadata = {
         "tau": tau,
         "n": n,
         "sigma": sigma_val,
-        "selected_centers": len(sel_center_idxs),
+        "selected_centers": np.count_nonzero(np.abs(model_weights) > 1e-5),
         "total_centers": config.m,
         "approach": config.approach,
         "optimizer_type": type(config.optimizer).__name__,
@@ -411,11 +576,9 @@ def run_control_experiment(
         dist_sq = torch.clamp(dist_sq, min=0.0)
 
         if config.sigma_global:
-            sigma = torch.nn.functional.softplus(log_sigma) + 1e-6
+            sigma = F.softplus(log_sigma) + 1e-6
         else:
-            sigma = (
-                torch.nn.functional.softplus(log_sigma).unsqueeze(0) + 1e-6
-            )  # (1, m)
+            sigma = F.softplus(log_sigma).unsqueeze(0) + 1e-6  # (1, m)
 
         if config.rbf == RadialBasisFunction.GAUSSIAN:
             if config.sigma_global:
@@ -453,7 +616,10 @@ def run_control_experiment(
             phi_val = _phi_from_params(X_val_split, C_param, log_sigma_param)
             proj_val = X_val_split @ Theta_param.T
             y_hat_val_ctrl = (phi_val * proj_val).sum(dim=1)
-            val_loss = torch.mean((y_hat_val_ctrl - d_val_split) ** 2)
+            val_loss = (
+                torch.mean((y_hat_val_ctrl - d_val_split) ** 2)
+                + config.ridge * (Theta_param**2).sum()
+            )
 
         # Check for improvement
         if val_loss < best_val_loss:

@@ -99,8 +99,10 @@ class SvdOptimizer(Optimizer):
         )
 
         # Robust 1D indices with sparsity control
-        abs_w = torch.abs(nu_hat)
-        selected_indices = torch.nonzero(abs_w > self._delta, as_tuple=True)[0]
+        # abs_w = torch.abs(nu_hat)
+        # selected_indices = torch.nonzero(abs_w > self._delta, as_tuple=True)[0]
+
+        selected_indices = torch.arange(P.shape[1])
 
         return (
             (selected_indices, nu_hat[selected_indices])
