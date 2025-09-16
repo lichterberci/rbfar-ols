@@ -1,5 +1,3 @@
-
-
 # RBFAR-OLS
 
 This repository contains code for my research on a modified method of OLS (orthogonal least squares), applied to RBF-AR (radial basis function - autoregressive) models.
@@ -318,7 +316,7 @@ $$
 Let us define $Q^{(k)}$ as the matrix formed by the first $k$ columns of $Q$ and zeros elsewhere, and $\Sigma^{(k)}$ as the matrix formed by the first $k$ rows and columns of $\Sigma'$ and zeros in the rest. Then we can rewrite the error as follows:
 
 $$
-\text{Error}_k = \lVert d - Q^{(k)} \Sigma^{(k)} Q^{(k)T} d \rVert_2^2
+\text{Error}_k = \lVert d - Q^{(k)} \Sigma'^{(k)} Q^{(k)T} d \rVert_2^2
 $$
 
 Our stopping criterion is based on the error:
@@ -327,14 +325,14 @@ $$
 \text{Error}_k < \epsilon
 $$
 
-where $\epsilon$ is a predefined threshold. When this condition is met, we stop the selection process and use the current $Q^{(k)}$ and $\Sigma^{(k)}$ for our reduced representation.
+where $\epsilon$ is a predefined threshold. When this condition is met, we stop the selection process and use the current $Q^{(k)}$ and $\Sigma'^{(k)}$ for our reduced representation.
 
 We can refine this process by optimizing the calculation of $\text{Error}_k$. We can achieve this by only calculating the differences of the errors.
 
 $$
 \begin{align*}
 \text{Error}_0 &= \lVert d \rVert_2^2 \\
-\text{Error}_k - \text{Error}_{k-1} &= \lVert d - Q^{(k)} \Sigma^{(k)} Q^{(k)T} d \rVert_2^2 - \lVert d - Q^{(k-1)} \Sigma^{(k-1)} Q^{(k-1)T} d \rVert_2^2 \\
+\text{Error}_k - \text{Error}_{k-1} &= \lVert d - Q^{(k)} \Sigma'^{(k)} Q^{(k)T} d \rVert_2^2 - \lVert d - Q^{(k-1)} \Sigma'^{(k-1)} Q^{(k-1)T} d \rVert_2^2 \\
 &= \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k-1}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
 &=\left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{\sigma_i'\left( q_i^T d \right)^2} + \sum_{i = 1}^{k}{\sigma_i'^{\:2} \left(q_i^T d\right)^2}\right)\\
@@ -362,3 +360,13 @@ Thus, we get our optimized centre-selection algorithm:
    1. Normalized Error$_k$ := Normalized Error$_{k-1} + \sigma_k'\left(\sigma_k' - 2\right)\frac{\left( q_k^T d \right)^2}{\lVert d \rVert_2^2}$
    2. If Normalized Error$_k$ < $\epsilon$ then:
       1. Stop
+
+## TODO
+
+- regularizations
+  - truncated SVD
+  - L1 regularization
+- other control method impl.
+- ozone dataset
+- non global sigma estimation
+- multistep forecast
