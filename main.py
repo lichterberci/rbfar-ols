@@ -8,7 +8,7 @@ import torch
 from permetrics import RegressionMetric
 
 from experiment_runner import (
-    ControlConfig,
+    ControlGDConfig,
     ProposedMethodConfig,
     run_comparison_experiments,
 )
@@ -52,7 +52,7 @@ if __name__ == "__main__":
         ]
     ]
 
-    control_config = ControlConfig(m=20)
+    control_config = ControlGDConfig(m=20)
 
     proposed_results, control_result = run_comparison_experiments(
         time_series,

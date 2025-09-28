@@ -5,10 +5,8 @@ This module provides functionality to run configurable experiments comparing
 SVD/OLS-based methods with a control method (Adam-optimized RBF) on given time series data.
 """
 
-import multiprocessing
-import os
 import warnings
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -34,6 +32,8 @@ from lag_estimation import AmiEstimator, OptimalLagSelectionMethod, estimate_tau
 from ols_optimizer import OlsOptimizer
 from optimizer import Optimizer
 from svd_based_optimizer import SvdOptimizer
+
+from em_vp import EMVPConfig, EMVPDiagnostics, EMVPModel, EMVPTrainer
 
 
 @dataclass
@@ -93,6 +93,11 @@ class ProposedMethodConfig(ExperimentConfig):
 
 @dataclass
 class ControlConfig(ExperimentConfig):
+    """Base configuration for control experiments."""
+
+
+@dataclass
+class ControlGDConfig(ControlConfig):
     """Configuration for control experiments using Adam-optimized RBF method."""
 
     # Control method parameters
@@ -105,6 +110,26 @@ class ControlConfig(ExperimentConfig):
     patience: int = 10  # early stopping patience
     val_split: float = 0.1  # validation split ratio
     ridge: float = 0.0  # L2 regularization (not used in Adam)
+
+
+@dataclass
+class ControlEMVPConfig(ControlConfig):
+    """Configuration for control experiments using the EM-VP algorithm."""
+
+    num_components: int = 5
+    max_iters: int = 200
+    tol_loglik: float = 1e-5
+    tol_param: float = 1e-4
+    min_variance: float = 1e-6
+    ridge: float = 1e-5
+    init_responsibility_temp: float = 1.0
+    init_width_scale: float = 0.5
+    loglik_window: int = 5
+    responsibility_floor: float = 1e-8
+    device: Optional[str] = None
+    dtype: torch.dtype = torch.float32
+    centre_sampling_ratio: float = 1.0
+    centre_restarts: int = 1
 
 
 def estimate_embedding_dimension_cao(y: np.ndarray, tau, max_m: int = 20) -> int:
@@ -481,7 +506,7 @@ def run_control_experiment(
     device: str = "cpu",
 ) -> ExperimentResult:
     """
-    Run control experiment with Adam-optimized RBF method.
+    Run control experiment with either the Adam-optimized RBF method or the EM-VP algorithm.
 
     Args:
         series: Time series data (noisy version)
@@ -494,39 +519,71 @@ def run_control_experiment(
     """
     series = series.astype(np.float32)
 
-    # Estimate tau from autocorrelation
-    if config.embedding_tau is not None:
-        tau = config.embedding_tau
-    else:
-        tau = estimate_tau_for_series(series)
+    tau = config.embedding_tau if config.embedding_tau is not None else estimate_tau_for_series(series)
+    n = config.n if config.n is not None else estimate_embedding_dimension_cao(
+        series, tau=tau, max_m=config.max_embedding_dim
+    )
 
-    # Estimate embedding dimension if not provided
-    n = config.n
-    if n is None:
-        n = estimate_embedding_dimension_cao(
-            series, tau=tau, max_m=config.max_embedding_dim
-        )
-
-    # Create lagged matrix
     X, d = make_lagged_matrix(series, n, tau)
 
-    # Train/test split
     split_idx = int(train_ratio * len(X))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    d_train, d_test = d[:split_idx], d[split_idx:]
+    X_train_np, X_test_np = X[:split_idx], X[split_idx:]
+    d_train_np, d_test_np = d[:split_idx], d[split_idx:]
 
-    # Convert to torch tensors
-    X_train = torch.from_numpy(X_train).to(device)
-    X_test = torch.from_numpy(X_test).to(device)
-    d_train = torch.from_numpy(d_train).to(device)
-    d_test = torch.from_numpy(d_test).to(device)
+    sigma_val = (
+        float(config.sigma)
+        if config.sigma is not None
+        else float(estimate_sigma_median(X_train_np))
+    )
 
-    # Estimate sigma if not provided
-    sigma_val = config.sigma
-    if sigma_val is None:
-        sigma_val = estimate_sigma_median(X_train.numpy())
+    X_train = torch.from_numpy(X_train_np).to(device)
+    X_test = torch.from_numpy(X_test_np).to(device)
+    d_train = torch.from_numpy(d_train_np).to(device)
+    d_test = torch.from_numpy(d_test_np).to(device)
 
-    # Validation split (10% of training data)
+    if isinstance(config, ControlGDConfig):
+        return _run_control_with_gradient_descent(
+            config=config,
+            X_train=X_train,
+            X_test=X_test,
+            d_train=d_train,
+            d_test=d_test,
+            tau=tau,
+            n=n,
+            sigma_val=sigma_val,
+        )
+
+    if isinstance(config, ControlEMVPConfig):
+        return _run_control_with_emvp(
+            config=config,
+            X_train=X_train,
+            X_test=X_test,
+            d_train=d_train,
+            d_test=d_test,
+            tau=tau,
+            n=n,
+            sigma_val=sigma_val,
+            base_device=device,
+        )
+
+    raise TypeError(
+        f"Unsupported control configuration type: {type(config).__name__}"
+    )
+
+
+def _run_control_with_gradient_descent(
+    *,
+    config: ControlGDConfig,
+    X_train: torch.Tensor,
+    X_test: torch.Tensor,
+    d_train: torch.Tensor,
+    d_test: torch.Tensor,
+    tau: int,
+    n: int,
+    sigma_val: float,
+) -> ExperimentResult:
+    """Execute the legacy gradient-descent-based control method."""
+
     val_size = int(config.val_split * X_train.shape[0])
     train_size = X_train.shape[0] - val_size
     X_train_split = X_train[:train_size]
@@ -534,57 +591,61 @@ def run_control_experiment(
     X_val_split = X_train[train_size:]
     d_val_split = d_train[train_size:]
 
-    # Initialize control model parameters
     torch.manual_seed(0)
+
+    if X_train_split.shape[0] == 0:
+        raise ValueError(
+            "Not enough training samples after validation split for control GD."
+        )
+
     m_ctrl = min(config.m, X_train_split.shape[0])
 
+    perm = torch.randperm(X_train_split.shape[0], device=X_train.device)
+    selected = perm[:m_ctrl]
     C_param = (
-        X_train_split[torch.randperm(X_train_split.shape[0])[:m_ctrl]]
+        X_train_split[selected]
         .clone()
         .detach()
         .requires_grad_(True)
     )  # (m, n) - centers
 
-    Theta_param = (0.01 * torch.randn(m_ctrl, X_train_split.shape[1])).requires_grad_(
+    Theta_param = (0.01 * torch.randn(m_ctrl, X_train_split.shape[1], device=X_train.device)).requires_grad_(
         True
     )  # (m, n) - projection weights
 
-    # Initialize sigma parameter
     if config.sigma_global:
         log_sigma_param = torch.tensor(
             np.log(float(sigma_val) + 1e-6),
             dtype=X_train_split.dtype,
+            device=X_train.device,
             requires_grad=config.train_sigma,
         )
     else:
-        init_sigma = torch.full((m_ctrl,), float(sigma_val), dtype=X_train_split.dtype)
+        init_sigma = torch.full(
+            (m_ctrl,), float(sigma_val), dtype=X_train_split.dtype, device=X_train.device
+        )
         log_sigma_param = torch.log(init_sigma + 1e-6)
         log_sigma_param.requires_grad_(config.train_sigma)
 
-    # Setup optimizer
-    params = [C_param, Theta_param]
+    params: List[torch.Tensor] = [C_param, Theta_param]
     if config.train_sigma:
         params.append(log_sigma_param)
 
     optim = torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
 
-    def _phi_from_params(X_in, C, log_sigma):
-        """Compute RBF features from parameters."""
+    def _phi_from_params(X_in: torch.Tensor, C: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
         x_sq = (X_in * X_in).sum(dim=1, keepdim=True)  # (l, 1)
         c_sq = (C * C).sum(dim=1)  # (m,)
-        dist_sq = x_sq + c_sq.unsqueeze(0) - 2.0 * (X_in @ C.T)  # (l, m)
+        dist_sq = x_sq + c_sq.unsqueeze(0) - 2.0 * (X_in @ C.T)
         dist_sq = torch.clamp(dist_sq, min=0.0)
 
         if config.sigma_global:
             sigma = F.softplus(log_sigma) + 1e-6
         else:
-            sigma = F.softplus(log_sigma).unsqueeze(0) + 1e-6  # (1, m)
+            sigma = F.softplus(log_sigma).unsqueeze(0) + 1e-6
 
         if config.rbf == RadialBasisFunction.GAUSSIAN:
-            if config.sigma_global:
-                denom = 2.0 * (sigma * sigma)
-            else:
-                denom = 2.0 * (sigma * sigma)  # (1, m)
+            denom = 2.0 * (sigma * sigma)
             phi = torch.exp(-dist_sq / denom)
         elif config.rbf == RadialBasisFunction.LAPLACIAN:
             dist = torch.sqrt(dist_sq + 1e-12)
@@ -594,24 +655,20 @@ def run_control_experiment(
 
         return phi
 
-    # Early stopping setup
     best_val_loss = float("inf")
     best_epoch = 0
     best_params = [p.clone() for p in params]
 
-    # Training loop
     for epoch in range(1, config.epochs + 1):
-        # Training step
-        phi_tr = _phi_from_params(X_train_split, C_param, log_sigma_param)  # (l_tr, m)
-        proj_tr = X_train_split @ Theta_param.T  # (l_tr, m)
-        y_hat_tr_ctrl = (phi_tr * proj_tr).sum(dim=1)  # (l_tr,)
+        phi_tr = _phi_from_params(X_train_split, C_param, log_sigma_param)
+        proj_tr = X_train_split @ Theta_param.T
+        y_hat_tr_ctrl = (phi_tr * proj_tr).sum(dim=1)
         loss = torch.mean((y_hat_tr_ctrl - d_train_split) ** 2)
 
         optim.zero_grad()
         loss.backward()
         optim.step()
 
-        # Validation step
         with torch.no_grad():
             phi_val = _phi_from_params(X_val_split, C_param, log_sigma_param)
             proj_val = X_val_split @ Theta_param.T
@@ -621,7 +678,6 @@ def run_control_experiment(
                 + config.ridge * (Theta_param**2).sum()
             )
 
-        # Check for improvement
         if val_loss < best_val_loss:
             best_val_loss = val_loss.item()
             best_epoch = epoch
@@ -629,18 +685,14 @@ def run_control_experiment(
         elif epoch - best_epoch >= config.patience:
             break
 
-    # Restore best parameters
-    for i, p in enumerate(params):
-        p.data = best_params[i].data
+    for i, param in enumerate(params):
+        param.data = best_params[i].data
 
-    # Generate predictions on full train and test sets
     with torch.no_grad():
-        # Training predictions
         phi_tr = _phi_from_params(X_train, C_param, log_sigma_param)
         proj_tr = X_train @ Theta_param.T
         train_pred = (phi_tr * proj_tr).sum(dim=1).cpu().numpy()
 
-        # Test predictions
         phi_te = _phi_from_params(X_test, C_param, log_sigma_param)
         proj_te = X_test @ Theta_param.T
         test_pred = (phi_te * proj_te).sum(dim=1).cpu().numpy()
@@ -667,6 +719,133 @@ def run_control_experiment(
     )
 
 
+def _run_control_with_emvp(
+    *,
+    config: ControlEMVPConfig,
+    X_train: torch.Tensor,
+    X_test: torch.Tensor,
+    d_train: torch.Tensor,
+    d_test: torch.Tensor,
+    tau: int,
+    n: int,
+    sigma_val: float,
+    base_device: str,
+) -> ExperimentResult:
+    """Execute the EM-VP-based control method."""
+
+    effective_device = config.device or base_device
+    dtype = config.dtype
+
+    if X_train.shape[0] == 0:
+        raise ValueError("Not enough training samples for EM-VP control method.")
+
+    X_train_device = X_train.to(device=effective_device, dtype=dtype)
+    X_test_device = X_test.to(device=effective_device, dtype=dtype)
+    d_train_device = d_train.to(device=effective_device, dtype=dtype)
+    d_test_device = d_test.to(device=effective_device, dtype=dtype)
+
+    def _sample_initial_centres() -> torch.Tensor:
+        pool_size = max(1, int(config.centre_sampling_ratio * X_train_device.shape[0]))
+        pool_indices = torch.randperm(X_train_device.shape[0], device=effective_device)[:pool_size]
+        if pool_indices.numel() > 1:
+            shuffle = torch.randperm(pool_indices.numel(), device=effective_device)
+            pool_indices = pool_indices[shuffle]
+        if pool_indices.numel() >= config.num_components:
+            chosen = pool_indices[: config.num_components]
+        else:
+            repeats = config.num_components - pool_indices.numel()
+            extra_idx = pool_indices[torch.randint(0, pool_indices.numel(), (repeats,), device=effective_device)]
+            chosen = torch.cat([pool_indices, extra_idx], dim=0)
+        return X_train_device[chosen].clone()
+
+    noise_base = torch.var(d_train_device, unbiased=False).item()
+    widths_base = max(sigma_val * config.init_width_scale, 1e-6)
+
+    best_model: Optional[EMVPModel] = None
+    best_diagnostics: Optional[EMVPDiagnostics] = None
+    best_log_likelihood = float("-inf")
+
+    for restart in range(max(1, config.centre_restarts)):
+        centres_init = _sample_initial_centres()
+        widths_init = torch.full(
+            (config.num_components,),
+            float(widths_base),
+            device=effective_device,
+            dtype=dtype,
+        )
+        noise_init = torch.full(
+            (config.num_components,),
+            float(noise_base + config.min_variance),
+            device=effective_device,
+            dtype=dtype,
+        )
+
+        trainer_config = EMVPConfig(
+            num_components=config.num_components,
+            max_iters=config.max_iters,
+            tol_loglik=config.tol_loglik,
+            tol_param=config.tol_param,
+            min_variance=config.min_variance,
+            ridge=config.ridge,
+            init_responsibility_temp=config.init_responsibility_temp,
+            init_width_scale=config.init_width_scale,
+            device=effective_device,
+            dtype=dtype,
+            loglik_window=config.loglik_window,
+            responsibility_floor=config.responsibility_floor,
+        )
+
+        trainer = EMVPTrainer(trainer_config)
+        model = trainer.fit(
+            X_train_device,
+            d_train_device,
+            centres_init=centres_init,
+            widths_init=widths_init,
+            noise_init=noise_init,
+        )
+
+        if trainer.diagnostics.log_likelihood:
+            final_loglik = trainer.diagnostics.log_likelihood[-1]
+        else:
+            final_loglik = float("-inf")
+
+        if final_loglik > best_log_likelihood:
+            best_log_likelihood = final_loglik
+            best_model = model
+            best_diagnostics = trainer.diagnostics
+
+    if best_model is None or best_diagnostics is None:
+        raise RuntimeError("EM-VP training did not produce a valid model")
+
+    train_pred = (
+        best_model.predict(X_train_device).detach().cpu().numpy()
+    )
+    test_pred = (
+        best_model.predict(X_test_device).detach().cpu().numpy()
+    )
+
+    metadata = {
+        "tau": tau,
+        "n": n,
+        "sigma": sigma_val,
+        "num_components": config.num_components,
+        "max_iters": config.max_iters,
+        "best_log_likelihood": float(best_log_likelihood),
+        "loglik_history": list(best_diagnostics.log_likelihood),
+        "centre_restarts": config.centre_restarts,
+        "device": effective_device,
+    }
+
+    return ExperimentResult(
+        train_predictions=train_pred,
+        test_predictions=test_pred,
+        train_targets=d_train.cpu().numpy(),
+        test_targets=d_test.cpu().numpy(),
+        method_name="Control-EMVP",
+        metadata=metadata,
+    )
+
+
 def run_experiment(
     series: np.ndarray,
     config: Union[ProposedMethodConfig, ControlConfig],
@@ -680,7 +859,7 @@ def run_experiment(
     Args:
         series: Time series data (noisy version)
         config: Experiment configuration (ProposedMethodConfig or ControlConfig)
-        method_type: "proposed" for SVD/OLS methods, "control" for Adam-optimized method
+    method_type: "proposed" for SVD/OLS methods, "control" for baseline methods (GD or EM-VP)
         train_ratio: Ratio of data to use for training
         device: Device to run computations on
 
@@ -716,11 +895,11 @@ def create_default_proposed_config(**kwargs) -> ProposedMethodConfig:
     return ProposedMethodConfig(**defaults)
 
 
-def create_default_control_config(**kwargs) -> ControlConfig:
-    """Create a default control configuration with optional overrides."""
+def create_default_control_config(**kwargs) -> ControlGDConfig:
+    """Create a default gradient-descent control configuration with optional overrides."""
     defaults = {"m": 14, "epochs": 1000, "lr": 5e-2}
     defaults.update(kwargs)
-    return ControlConfig(**defaults)
+    return ControlGDConfig(**defaults)
 
 
 def run_comparison_experiments(
