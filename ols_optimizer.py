@@ -132,7 +132,7 @@ class OlsOptimizer(Optimizer):
                 if k == 0:
                     denom = p_norm_sqrd_rem.clamp_min(eps)
                 else:
-                    # denom = ||p_i||^2 - sum_j (C[j,i]^2 / ||w_j||^2)
+                    # Math: denom = ||p_i||^2 - \sum_j \frac{C[j,i]^2}{ ||w_j||^2}
                     denom = p_norm_sqrd_rem - (
                         C_mat.pow(2) / (w_norm_sqrd_vec[:k].unsqueeze(1) + eps)
                     ).sum(dim=0)
