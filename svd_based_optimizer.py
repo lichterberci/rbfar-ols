@@ -26,18 +26,26 @@ class SvdOptimizer(Optimizer):
     For further details, please refer to the documentation.
     """
 
-    def __init__(self, epsilon: float = 1e-2, alpha: float = 1e-5, delta: float = 1e-6):
+    def __init__(
+        self,
+        epsilon: float = 1e-2,
+        alpha: float = 1e-5,
+        delta: float = 1e-6,
+        beta: float = None,
+    ):
         """Initialize the SvdOlsOptimizer.
 
         Args:
             epsilon (float, optional): The convergence threshold. Defaults to 1e-2.
             alpha (float, optional): The regularization parameter. Defaults to 1e-5.
             delta (float, optional): The sparsity parameter. Defaults to 1e-6.
+            beta (float, optional): The maximum value of any singular value. Defaults to None.
         """
 
         self._epsilon = epsilon
         self._alpha = alpha
         self._delta = delta
+        self._beta = beta
 
     def optimize(
         self,
@@ -62,6 +70,9 @@ class SvdOptimizer(Optimizer):
         # Perform reduced SVD: P = U @ diag(sigma) @ Vh
         # Shapes: U (l, k), sigma (k,), Vh (k, m), where k = min(l, m)
         U, sigma, Vh = torch.linalg.svd(P, full_matrices=False)
+
+        if self._beta is not None:
+            sigma = torch.clamp(sigma, max=self._beta)
 
         # reg_sigma_inv = (Sigma^T @ Sigma + alpha * I)^-1 @ Sigma^T
         regularized_sigma_inv = sigma / (sigma**2 + self._alpha)
