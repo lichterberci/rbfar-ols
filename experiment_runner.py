@@ -279,6 +279,13 @@ def run_proposed_experiment(
             # The weights here are already the final weights for each center
 
             adjustable_weights = model_weights.clone().detach().requires_grad_(True)
+            selected_centres = centers[selected_indices]
+            nu_hat_train_for_selected_centres = nu_hat_train[selected_indices]
+
+            if adjustable_weights.shape[0] != selected_centres.shape[0]:
+                raise ValueError(
+                    "Mismatch between adjustable weights and selected centres."
+                )
 
             # Post-tune using Adam with early stopping
             optim = torch.optim.Adam([adjustable_weights], lr=config.tuning_lr)
@@ -298,8 +305,8 @@ def run_proposed_experiment(
             P_train_for_tuning = construct_design_matrix_with_local_pretraining(
                 X_train_for_tuning,
                 d_train_for_tuning,  # Not used when weights are provided
-                centres=centers,  # Use the correct variable name
-                weights=nu_hat_train,  # Use the pretraining weights
+                centres=selected_centres,  # Use the correct variable name
+                weights=nu_hat_train_for_selected_centres,  # Use the pretraining weights
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
@@ -307,8 +314,8 @@ def run_proposed_experiment(
             P_valid_for_tuning = construct_design_matrix_with_local_pretraining(
                 X_valid_for_tuning,
                 d_valid_for_tuning,  # Not used when weights are provided
-                centres=centers,  # Use the correct variable name
-                weights=nu_hat_train,  # Use the pretraining weights
+                centres=selected_centres,  # Use the correct variable name
+                weights=nu_hat_train_for_selected_centres,  # Use the pretraining weights
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
@@ -344,9 +351,18 @@ def run_proposed_experiment(
 
             # Generate predictions using tuned weights
             with torch.no_grad():
-                train_pred = (P_train @ adjustable_weights).squeeze().cpu().numpy()
-                test_pred = (P_test @ adjustable_weights).squeeze().cpu().numpy()
-
+                train_pred = (
+                    (P_train[:, selected_indices] @ adjustable_weights)
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                )
+                test_pred = (
+                    (P_test[:, selected_indices] @ adjustable_weights)
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                )
         else:  # no-pretraining approach
             # For no-pretraining: tune centers, weights, and sigma
 
@@ -384,7 +400,7 @@ def run_proposed_experiment(
 
             # For no-pretraining, we need to create a full weight vector (m*n,)
             # The optimizer gave us weights only for selected indices
-            m, n = centers.shape[0], X_train.shape[1]
+            m, n = adjustable_centers.shape[0], X_train.shape[1]
             full_weights = torch.zeros(m * n, device=device, dtype=model_weights.dtype)
             full_weights[selected_indices] = model_weights
             adjustable_weights = full_weights.clone().detach().requires_grad_(True)
@@ -392,7 +408,7 @@ def run_proposed_experiment(
             adjustable_log_sigma = torch.tensor(
                 float(np.log(sigma_val) + 1e-6),
                 device=device,
-                dtype=centers.dtype,
+                dtype=adjustable_centers.dtype,
                 requires_grad=True,
             )
 
@@ -474,8 +490,12 @@ def run_proposed_experiment(
                 )  # (l_te, m*n)
                 test_pred = (P_te @ adjustable_weights).squeeze().cpu().numpy()
     else:  # no post-tuning
-        train_pred = (P_train @ model_weights).squeeze().cpu().numpy()
-        test_pred = (P_test @ model_weights).squeeze().cpu().numpy()
+        train_pred = (
+            (P_train[:, selected_indices] @ model_weights).squeeze().cpu().numpy()
+        )
+        test_pred = (
+            (P_test[:, selected_indices] @ model_weights).squeeze().cpu().numpy()
+        )
 
     metadata = {
         "tau": tau,
@@ -519,9 +539,17 @@ def run_control_experiment(
     """
     series = series.astype(np.float32)
 
-    tau = config.embedding_tau if config.embedding_tau is not None else estimate_tau_for_series(series)
-    n = config.n if config.n is not None else estimate_embedding_dimension_cao(
-        series, tau=tau, max_m=config.max_embedding_dim
+    tau = (
+        config.embedding_tau
+        if config.embedding_tau is not None
+        else estimate_tau_for_series(series)
+    )
+    n = (
+        config.n
+        if config.n is not None
+        else estimate_embedding_dimension_cao(
+            series, tau=tau, max_m=config.max_embedding_dim
+        )
     )
 
     X, d = make_lagged_matrix(series, n, tau)
@@ -566,9 +594,7 @@ def run_control_experiment(
             base_device=device,
         )
 
-    raise TypeError(
-        f"Unsupported control configuration type: {type(config).__name__}"
-    )
+    raise TypeError(f"Unsupported control configuration type: {type(config).__name__}")
 
 
 def _run_control_with_gradient_descent(
@@ -603,13 +629,12 @@ def _run_control_with_gradient_descent(
     perm = torch.randperm(X_train_split.shape[0], device=X_train.device)
     selected = perm[:m_ctrl]
     C_param = (
-        X_train_split[selected]
-        .clone()
-        .detach()
-        .requires_grad_(True)
+        X_train_split[selected].clone().detach().requires_grad_(True)
     )  # (m, n) - centers
 
-    Theta_param = (0.01 * torch.randn(m_ctrl, X_train_split.shape[1], device=X_train.device)).requires_grad_(
+    Theta_param = (
+        0.01 * torch.randn(m_ctrl, X_train_split.shape[1], device=X_train.device)
+    ).requires_grad_(
         True
     )  # (m, n) - projection weights
 
@@ -622,7 +647,10 @@ def _run_control_with_gradient_descent(
         )
     else:
         init_sigma = torch.full(
-            (m_ctrl,), float(sigma_val), dtype=X_train_split.dtype, device=X_train.device
+            (m_ctrl,),
+            float(sigma_val),
+            dtype=X_train_split.dtype,
+            device=X_train.device,
         )
         log_sigma_param = torch.log(init_sigma + 1e-6)
         log_sigma_param.requires_grad_(config.train_sigma)
@@ -633,7 +661,9 @@ def _run_control_with_gradient_descent(
 
     optim = torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
 
-    def _phi_from_params(X_in: torch.Tensor, C: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
+    def _phi_from_params(
+        X_in: torch.Tensor, C: torch.Tensor, log_sigma: torch.Tensor
+    ) -> torch.Tensor:
         x_sq = (X_in * X_in).sum(dim=1, keepdim=True)  # (l, 1)
         c_sq = (C * C).sum(dim=1)  # (m,)
         dist_sq = x_sq + c_sq.unsqueeze(0) - 2.0 * (X_in @ C.T)
@@ -746,7 +776,9 @@ def _run_control_with_emvp(
 
     def _sample_initial_centres() -> torch.Tensor:
         pool_size = max(1, int(config.centre_sampling_ratio * X_train_device.shape[0]))
-        pool_indices = torch.randperm(X_train_device.shape[0], device=effective_device)[:pool_size]
+        pool_indices = torch.randperm(X_train_device.shape[0], device=effective_device)[
+            :pool_size
+        ]
         if pool_indices.numel() > 1:
             shuffle = torch.randperm(pool_indices.numel(), device=effective_device)
             pool_indices = pool_indices[shuffle]
@@ -754,7 +786,11 @@ def _run_control_with_emvp(
             chosen = pool_indices[: config.num_components]
         else:
             repeats = config.num_components - pool_indices.numel()
-            extra_idx = pool_indices[torch.randint(0, pool_indices.numel(), (repeats,), device=effective_device)]
+            extra_idx = pool_indices[
+                torch.randint(
+                    0, pool_indices.numel(), (repeats,), device=effective_device
+                )
+            ]
             chosen = torch.cat([pool_indices, extra_idx], dim=0)
         return X_train_device[chosen].clone()
 
@@ -817,12 +853,8 @@ def _run_control_with_emvp(
     if best_model is None or best_diagnostics is None:
         raise RuntimeError("EM-VP training did not produce a valid model")
 
-    train_pred = (
-        best_model.predict(X_train_device).detach().cpu().numpy()
-    )
-    test_pred = (
-        best_model.predict(X_test_device).detach().cpu().numpy()
-    )
+    train_pred = best_model.predict(X_train_device).detach().cpu().numpy()
+    test_pred = best_model.predict(X_test_device).detach().cpu().numpy()
 
     metadata = {
         "tau": tau,
