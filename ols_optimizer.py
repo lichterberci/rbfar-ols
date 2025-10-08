@@ -31,15 +31,17 @@ class OlsOptimizer(Optimizer):
     - Keep the upper-triangular A in packed form during iteration; build dense once.
     """
 
-    def __init__(self, rho: float = 0.01, epsilon: float = 1e-8):
+    def __init__(self, rho: float = 0.01, alpha=0.01, epsilon: float = 1e-8):
         """Initialize the OlsOptimizer.
 
         Args:
             rho: Normalized residual energy threshold to stop (smaller means more features).
+            alpha: Regularization parameter for numerical stability in computations.
             epsilon: Small value to stabilize divisions and inner products.
         """
         self._rho = float(rho)
         self._epsilon = float(epsilon)
+        self._alpha = float(alpha)
 
     # Disable lint warnings about non-PEP8 naming for the following method:
     # pylint: disable=invalid-name
@@ -224,7 +226,9 @@ class OlsOptimizer(Optimizer):
             # Compute g_hat = H^{-1} W^T d_centered with H diagonal of ||w_j||^2
             W_materialized = torch.stack(W_cols, dim=1)  # (l, M_s)
             H_diag = w_norm_sqrd_vec[:M_s]  # (M_s,)
-            g_hat = (W_materialized.transpose(0, 1) @ d_centered) / H_diag  # (M_s,)
+            g_hat = (W_materialized.transpose(0, 1) @ d_centered) / (
+                H_diag + self._alpha
+            )  # (M_s,)
 
             # Solve A theta = g_hat for theta (A upper, unit diag) via back-substitution
             theta_hat = g_hat.clone()
