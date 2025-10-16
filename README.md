@@ -337,7 +337,7 @@ $$
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k-1}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
 &=\left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{\sigma_i'\left( q_i^T d \right)^2} + \sum_{i = 1}^{k}{\sigma_i'^{\:2} \left(q_i^T d\right)^2}\right)\\
 &\:\:\:\:- \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^{k-1}{\sigma_i'\left( q_i^T d \right)^2} + \sum_{i = 1}^{k-1}{ \sigma_i'^{\:2} \left(q_i^T d\right)^2}\right)\\
-&=\left( \lVert d \rVert_2^2 + \sum_{i=1}^k{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right)\\****
+&=\left( \lVert d \rVert_2^2 + \sum_{i=1}^k{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right)\\
 &\:\:\:\:-\left( \lVert d \rVert_2^2 + \sum_{i=1}^{k-1}{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right) \\
 &= \sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2
 \end{align*}
@@ -364,9 +364,6 @@ Thus, we get our optimized centre-selection algorithm:
 ## TODO
 
 - regularizations
-  - truncated SVD
   - L1 regularization
-- other control method impl.
-- ozone dataset
 - non global sigma estimation
 - multistep forecast

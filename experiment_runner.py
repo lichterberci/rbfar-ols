@@ -288,7 +288,10 @@ def run_proposed_experiment(
                 )
 
             # Post-tune using Adam with early stopping
-            optim = torch.optim.Adam([adjustable_weights], lr=config.tuning_lr)
+            optim = torch.optim.Adam(
+                [adjustable_weights],
+                lr=config.tuning_lr,
+            )
 
             best_weights = adjustable_weights.clone()
             best_loss = float("inf")
@@ -324,7 +327,9 @@ def run_proposed_experiment(
             for _ in range(config.tuning_max_epochs):
                 # Training step
                 pred = (P_train_for_tuning @ adjustable_weights).squeeze()
-                loss = torch.mean((pred - d_train_for_tuning) ** 2)
+                loss = torch.mean(
+                    (pred - d_train_for_tuning) ** 2
+                )  # TODO: regularization (L2?)
 
                 optim.zero_grad()
                 loss.backward()
