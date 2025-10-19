@@ -149,7 +149,7 @@ def test_local_pretraining_large_sigma_columns_equal_to_ridge_prediction(
     eye = torch.eye(n)
     a = X.T @ X + ridge * eye
     b = X.T @ d
-    coef = torch.linalg.solve(a, b)
+    coef = torch.linalg.lstsq(a, b).solution
     z = X @ coef
     # Each column should equal z
     assert torch.allclose(P, z.unsqueeze(1).expand(-1, m), rtol=1e-5, atol=1e-5)

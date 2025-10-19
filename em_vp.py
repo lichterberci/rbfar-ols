@@ -65,11 +65,17 @@ class EMVPDiagnostics:
 
 @dataclass
 class EMVPState:
-    """Container describing the learned model parameters."""
+    """Container describing the learned model parameters.
 
-    centres: Tensor
-    widths: Tensor
-    ar_weights: Tensor
+    The model uses (n+1) functions φᵢ for i=0..n, where:
+    - φ₀: constant function
+    - φᵢ: coefficient function for feature i
+    Each function has parameters [νᵢ,₀, νᵢ,₁, ..., νᵢ,ₘ] of shape (m+1,)
+    """
+
+    centres: Tensor  # RBF centers (m, n)
+    widths: Tensor  # RBF widths (m,)
+    function_params: Tensor  # Function parameters (num_components, n+1, m+1)
     mixing_logits: Tensor
     noise_vars: Tensor
     responsibilities: Tensor
@@ -96,11 +102,37 @@ class EMVPModel:
         X = _ensure_tensor(X, self._state.config)
         centres = self._state.centres
         widths = self._state.widths
-        weights = self._state.ar_weights
+        function_params = self._state.function_params  # (num_components, n+1, m+1)
         mixing = self._state.mixing_probs
 
-        features = _gaussian_activations(X, centres, widths)
-        local_means = X @ weights.T  # (N, M)
+        N, n = X.shape
+        m = centres.shape[0]
+        num_components = function_params.shape[0]
+
+        # Compute RBF activations
+        features = _gaussian_activations(X, centres, widths)  # (N, m)
+        ones_col = torch.ones(N, 1, device=X.device, dtype=X.dtype)
+
+        # Compute local predictions for each component
+        local_means = torch.zeros(N, num_components, device=X.device, dtype=X.dtype)
+
+        for k in range(num_components):
+            # φ₀(X) = ν₀,₀ + Σⱼ ν₀,ⱼ Ψⱼ(X)
+            phi_0 = function_params[k, 0, 0] + (
+                features @ function_params[k, 0, 1:]
+            )  # (N,)
+
+            # Σᵢ φᵢ(X) * Xᵢ where φᵢ(X) = νᵢ,₀ + Σⱼ νᵢ,ⱼ Ψⱼ(X)
+            phi_coeff_sum = torch.zeros(N, device=X.device, dtype=X.dtype)
+            for i in range(n):
+                phi_i = function_params[k, i + 1, 0] + (
+                    features @ function_params[k, i + 1, 1:]
+                )  # (N,)
+                phi_coeff_sum += phi_i * X[:, i]
+
+            local_means[:, k] = phi_0 + phi_coeff_sum
+
+        # Compute gating weights and final prediction
         log_gating = torch.log(mixing + 1e-12) + torch.log(features + 1e-12)
         weights_resp = torch.softmax(log_gating, dim=1)
         predictions = (weights_resp * local_means).sum(dim=1)
@@ -157,20 +189,24 @@ class EMVPTrainer:
             )
         )
 
-        ar_weights = _init_ar_weights(X, y, centres.shape[0], cfg)
+        function_params = _init_function_params(X, y, centres.shape[0], cfg)
         responsibilities = _init_responsibilities(N, centres.shape[0], cfg, device)
 
         for iteration in range(cfg.max_iters):
             features = _gaussian_activations(X, centres, widths)
-            local_means = X @ ar_weights.T
+            local_means = _compute_local_means(X, features, function_params)
             log_prob = _component_log_prob(
                 y, local_means, features, mixing_logits, noise_vars
             )
             responsibilities = _normalize_log_prob(log_prob, cfg)
 
             centres_new, widths_new = _update_centres_widths(X, responsibilities, cfg)
-            ar_weights_new = _update_ar_weights(X, y, responsibilities, ar_weights, cfg)
-            noise_vars_new = _update_noise(X, y, responsibilities, ar_weights_new, cfg)
+            function_params_new = _update_function_params(
+                X, y, responsibilities, features, function_params, cfg
+            )
+            noise_vars_new = _update_noise_new(
+                X, y, responsibilities, features, function_params_new, cfg
+            )
             mixing_logits_new = _update_mixing(responsibilities)
 
             log_likelihood = _log_likelihood_from_log_prob(log_prob)
@@ -178,14 +214,14 @@ class EMVPTrainer:
                 (
                     centres,
                     widths,
-                    ar_weights,
+                    function_params,
                     mixing_logits,
                     noise_vars,
                 ),
                 (
                     centres_new,
                     widths_new,
-                    ar_weights_new,
+                    function_params_new,
                     mixing_logits_new,
                     noise_vars_new,
                 ),
@@ -198,7 +234,7 @@ class EMVPTrainer:
 
             centres = centres_new
             widths = widths_new
-            ar_weights = ar_weights_new
+            function_params = function_params_new
             noise_vars = noise_vars_new
             mixing_logits = mixing_logits_new
 
@@ -208,7 +244,7 @@ class EMVPTrainer:
         final_state = EMVPState(
             centres=centres,
             widths=widths,
-            ar_weights=ar_weights,
+            function_params=function_params,
             mixing_logits=mixing_logits,
             noise_vars=noise_vars,
             responsibilities=responsibilities,
@@ -274,17 +310,80 @@ def _init_widths(
     return torch.full((centres.shape[0],), width, device=X.device, dtype=X.dtype)
 
 
-def _init_ar_weights(
+def _init_function_params(
     X: Tensor,
     y: Tensor,
     m: int,
     cfg: EMVPConfig,
 ) -> Tensor:
+    """Initialize function parameters for (n+1) functions with (m+1) parameters each.
+
+    Returns tensor of shape (num_components, n+1, m+1) where:
+    - First dimension: mixture component
+    - Second dimension: function index (0=constant, 1..n=feature coefficients)
+    - Third dimension: parameter index (0=global, 1..m=RBF centers)
+    """
+    device = X.device
+    dtype = X.dtype
+    n = X.shape[1]
+    num_components = cfg.num_components
+
+    # Initialize with small random values
+    function_params = 0.01 * torch.randn(
+        num_components, n + 1, m + 1, device=device, dtype=dtype
+    )
+
+    # Initialize global terms from simple linear regression
     ridge = cfg.ridge
-    XtX = X.T @ X + ridge * torch.eye(X.shape[1], device=X.device, dtype=X.dtype)
-    XtY = X.T @ y
-    base_weights = torch.linalg.solve(XtX, XtY)
-    return base_weights.T.repeat(m, 1)
+    ones_col = torch.ones(X.shape[0], 1, device=device, dtype=dtype)
+    X_aug = torch.cat([ones_col, X], dim=1)  # (N, n+1)
+    XtX = X_aug.T @ X_aug + ridge * torch.eye(n + 1, device=device, dtype=dtype)
+    XtY = X_aug.T @ y.squeeze()
+    base_params = torch.linalg.lstsq(XtX, XtY).solution  # (n+1,)
+
+    # Set global terms (index 0) for all components and functions
+    for k in range(num_components):
+        function_params[k, :, 0] = base_params  # Global terms
+
+    return function_params
+
+
+def _compute_local_means(
+    X: Tensor, features: Tensor, function_params: Tensor
+) -> Tensor:
+    """Compute local means for each component using the function parameters.
+
+    Args:
+        X: Input tensor (N, n)
+        features: RBF activations (N, m)
+        function_params: Function parameters (num_components, n+1, m+1)
+
+    Returns:
+        local_means: Tensor of shape (N, num_components)
+    """
+    N, n = X.shape
+    m = features.shape[1]
+    num_components = function_params.shape[0]
+
+    local_means = torch.zeros(N, num_components, device=X.device, dtype=X.dtype)
+
+    for k in range(num_components):
+        # φ₀(X) = ν₀,₀ + Σⱼ ν₀,ⱼ Ψⱼ(X)
+        phi_0 = function_params[k, 0, 0] + (
+            features @ function_params[k, 0, 1:]
+        )  # (N,)
+
+        # Σᵢ φᵢ(X) * Xᵢ where φᵢ(X) = νᵢ,₀ + Σⱼ νᵢ,ⱼ Ψⱼ(X)
+        phi_coeff_sum = torch.zeros(N, device=X.device, dtype=X.dtype)
+        for i in range(n):
+            phi_i = function_params[k, i + 1, 0] + (
+                features @ function_params[k, i + 1, 1:]
+            )  # (N,)
+            phi_coeff_sum += phi_i * X[:, i]
+
+        local_means[:, k] = phi_0 + phi_coeff_sum
+
+    return local_means
 
 
 def _init_responsibilities(
@@ -351,28 +450,61 @@ def _update_centres_widths(
     return centres_new, widths_new
 
 
-def _update_ar_weights(
+def _update_function_params(
     X: Tensor,
     y: Tensor,
     responsibilities: Tensor,
-    current_weights: Tensor,
+    features: Tensor,
+    current_function_params: Tensor,
     cfg: EMVPConfig,
 ) -> Tensor:
-    m = responsibilities.shape[1]
-    P = X.shape[1]
-    ridge = cfg.ridge
-    weights_new = torch.zeros_like(current_weights)
+    """Update function parameters using weighted least squares for each component.
 
-    for k in range(m):
-        gamma = responsibilities[:, k].unsqueeze(1)
-        weighted_X = torch.sqrt(gamma) * X
-        weighted_y = torch.sqrt(gamma) * y
-        XtX = weighted_X.T @ weighted_X + ridge * torch.eye(
-            P, device=X.device, dtype=X.dtype
-        )
-        XtY = weighted_X.T @ weighted_y
-        weights_new[k] = torch.linalg.solve(XtX, XtY).squeeze(1)
-    return weights_new
+    For each component k, solve for the (n+1)*(m+1) parameters that minimize:
+    Σᵢ γᵢₖ (yᵢ - ŷᵢₖ)² where ŷᵢₖ = φ₀(Xᵢ) + Σⱼ φⱼ(Xᵢ) * Xᵢⱼ
+    """
+    N, n = X.shape
+    m = features.shape[1]
+    num_components = responsibilities.shape[1]
+    ridge = cfg.ridge
+
+    # Build design matrix for the full model
+    # For each sample i: [1, Ψ₁(Xᵢ), ..., Ψₘ(Xᵢ), Xᵢ₁, Xᵢ₁*Ψ₁(Xᵢ), ..., Xᵢₙ*Ψₘ(Xᵢ)]
+    ones_col = torch.ones(N, 1, device=X.device, dtype=X.dtype)
+
+    # φ₀ terms: [1, Ψ₁, Ψ₂, ..., Ψₘ]
+    phi_0_design = torch.cat([ones_col, features], dim=1)  # (N, m+1)
+
+    # φᵢ terms for i=1..n: [Xᵢ, Xᵢ*Ψ₁, Xᵢ*Ψ₂, ..., Xᵢ*Ψₘ]
+    phi_i_designs = []
+    for i in range(n):
+        X_i = X[:, i : i + 1]  # (N, 1)
+        phi_i_design = torch.cat([X_i, X_i * features], dim=1)  # (N, m+1)
+        phi_i_designs.append(phi_i_design)
+
+    # Full design matrix: [φ₀_terms, φ₁_terms, ..., φₙ_terms]
+    full_design = torch.cat([phi_0_design] + phi_i_designs, dim=1)  # (N, (n+1)*(m+1))
+
+    function_params_new = torch.zeros_like(current_function_params)
+
+    for k in range(num_components):
+        gamma = responsibilities[:, k]  # (N,)
+
+        # Weighted least squares: solve (D^T W D + λI) θ = D^T W y
+        sqrt_weights = torch.sqrt(gamma.clamp_min(cfg.responsibility_floor))
+        weighted_design = sqrt_weights.unsqueeze(1) * full_design  # (N, (n+1)*(m+1))
+        weighted_y = sqrt_weights * y.squeeze()  # (N,)
+
+        # Normal equations
+        AtA = weighted_design.T @ weighted_design  # ((n+1)*(m+1), (n+1)*(m+1))
+        AtA += ridge * torch.eye(AtA.shape[0], device=X.device, dtype=X.dtype)
+        Atb = weighted_design.T @ weighted_y  # ((n+1)*(m+1),)
+
+        # Solve and reshape back to (n+1, m+1)
+        params_flat = torch.linalg.lstsq(AtA, Atb).solution  # ((n+1)*(m+1),)
+        function_params_new[k] = params_flat.reshape(n + 1, m + 1)
+
+    return function_params_new
 
 
 def _update_noise(
@@ -380,9 +512,30 @@ def _update_noise(
     y: Tensor,
     responsibilities: Tensor,
     weights: Tensor,
+    constants: Tensor,
     cfg: EMVPConfig,
 ) -> Tensor:
-    residuals = y - X @ weights.T
+    residuals = y - (X @ weights.T + constants.unsqueeze(0))
+    sq_resid = residuals.pow(2)
+    Nk = responsibilities.sum(dim=0).clamp_min(cfg.responsibility_floor)
+    noise = (responsibilities * sq_resid).sum(dim=0) / Nk
+    noise = noise.clamp_min(cfg.min_variance)
+    return noise
+
+
+def _update_noise_new(
+    X: Tensor,
+    y: Tensor,
+    responsibilities: Tensor,
+    features: Tensor,
+    function_params: Tensor,
+    cfg: EMVPConfig,
+) -> Tensor:
+    """Update noise variances using the new function parameters structure."""
+    local_means = _compute_local_means(
+        X, features, function_params
+    )  # (N, num_components)
+    residuals = y.squeeze().unsqueeze(1) - local_means  # (N, num_components)
     sq_resid = residuals.pow(2)
     Nk = responsibilities.sum(dim=0).clamp_min(cfg.responsibility_floor)
     noise = (responsibilities * sq_resid).sum(dim=0) / Nk

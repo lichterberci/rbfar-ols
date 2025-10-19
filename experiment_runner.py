@@ -643,6 +643,11 @@ def _run_control_with_gradient_descent(
         True
     )  # (m, n) - projection weights
 
+    # Add constant terms parameter
+    Beta_param = (0.01 * torch.randn(m_ctrl, device=X_train.device)).requires_grad_(
+        True
+    )  # (m,) - constant terms for each center
+
     if config.sigma_global:
         log_sigma_param = torch.tensor(
             np.log(float(sigma_val) + 1e-6),
@@ -660,7 +665,7 @@ def _run_control_with_gradient_descent(
         log_sigma_param = torch.log(init_sigma + 1e-6)
         log_sigma_param.requires_grad_(config.train_sigma)
 
-    params: List[torch.Tensor] = [C_param, Theta_param]
+    params: List[torch.Tensor] = [C_param, Theta_param, Beta_param]
     if config.train_sigma:
         params.append(log_sigma_param)
 
@@ -697,7 +702,8 @@ def _run_control_with_gradient_descent(
     for epoch in range(1, config.epochs + 1):
         phi_tr = _phi_from_params(X_train_split, C_param, log_sigma_param)
         proj_tr = X_train_split @ Theta_param.T
-        y_hat_tr_ctrl = (phi_tr * proj_tr).sum(dim=1)
+        const_tr = Beta_param.unsqueeze(0)  # (1, m)
+        y_hat_tr_ctrl = (phi_tr * (proj_tr + const_tr)).sum(dim=1)
         loss = torch.mean((y_hat_tr_ctrl - d_train_split) ** 2)
 
         optim.zero_grad()
@@ -707,10 +713,12 @@ def _run_control_with_gradient_descent(
         with torch.no_grad():
             phi_val = _phi_from_params(X_val_split, C_param, log_sigma_param)
             proj_val = X_val_split @ Theta_param.T
-            y_hat_val_ctrl = (phi_val * proj_val).sum(dim=1)
+            const_val = Beta_param.unsqueeze(0)  # (1, m)
+            y_hat_val_ctrl = (phi_val * (proj_val + const_val)).sum(dim=1)
             val_loss = (
                 torch.mean((y_hat_val_ctrl - d_val_split) ** 2)
                 + config.ridge * (Theta_param**2).sum()
+                + config.ridge * (Beta_param**2).sum()
             )
 
         if val_loss < best_val_loss:
@@ -726,11 +734,13 @@ def _run_control_with_gradient_descent(
     with torch.no_grad():
         phi_tr = _phi_from_params(X_train, C_param, log_sigma_param)
         proj_tr = X_train @ Theta_param.T
-        train_pred = (phi_tr * proj_tr).sum(dim=1).cpu().numpy()
+        const_tr = Beta_param.unsqueeze(0)  # (1, m)
+        train_pred = (phi_tr * (proj_tr + const_tr)).sum(dim=1).cpu().numpy()
 
         phi_te = _phi_from_params(X_test, C_param, log_sigma_param)
         proj_te = X_test @ Theta_param.T
-        test_pred = (phi_te * proj_te).sum(dim=1).cpu().numpy()
+        const_te = Beta_param.unsqueeze(0)  # (1, m)
+        test_pred = (phi_te * (proj_te + const_te)).sum(dim=1).cpu().numpy()
 
     metadata = {
         "tau": tau,
@@ -777,7 +787,6 @@ def _run_control_with_emvp(
     X_train_device = X_train.to(device=effective_device, dtype=dtype)
     X_test_device = X_test.to(device=effective_device, dtype=dtype)
     d_train_device = d_train.to(device=effective_device, dtype=dtype)
-    d_test_device = d_test.to(device=effective_device, dtype=dtype)
 
     def _sample_initial_centres() -> torch.Tensor:
         pool_size = max(1, int(config.centre_sampling_ratio * X_train_device.shape[0]))

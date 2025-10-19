@@ -80,13 +80,15 @@ def construct_design_matrix_with_no_pretraining(
 ):
     """Build the design matrix P for the "second approach" (no pre-training).
 
-    Given samples X in R^{l x n} and a set of centres C, compute the activation
-    matrix Phi (l x m) using an RBF, then construct P in R^{l x (m*n)} where each
-    group of n columns corresponds to a centre and equals Phi[:, j] element-wise
-    multiplied by each column of X.
+    Given samples X in R^{l x n} and a set of centres C, construct P in R^{l x (n+1)*(m+1)} where:
+    - We have (n+1) functions: φ₀(X) (constant), φ₁(X), ..., φₙ(X) (coefficients for each feature)
+    - Each function φᵢ(X) = νᵢ,₀ + Σⱼ₌₁ᵐ νᵢ,ⱼ Ψⱼ(X) has (m+1) parameters
+    - Total parameters: (n+1) functions × (m+1) parameters = (n+1)*(m+1)
 
-    Specifically, using 1-based indexing in the documentation's notation:
-        P_{i, (j-1)*n + k} = Phi_{i, j} * X_{i, k}
+    Column layout: [φ₀_global, φ₀_center1, ..., φ₀_centerₘ, φ₁_global, φ₁_center1, ...]
+    Specifically: P[:, i*(m+1) + 0] = 1 (global terms)
+                  P[:, i*(m+1) + j+1] = Ψⱼ(X) for i=0 (constant function)
+                  P[:, i*(m+1) + j+1] = Ψⱼ(X) * X[:, i-1] for i=1..n (feature functions)
 
     Args:
         X: Input matrix of shape (l, n). Torch tensor or NumPy array.
@@ -96,7 +98,7 @@ def construct_design_matrix_with_no_pretraining(
         radial_basis_function: Choice of RBF (Gaussian or Laplacian).
 
     Returns:
-        P with shape (l, m*n), same array/tensor type as X.
+        P with shape (l, (n+1)*(m+1)), same array/tensor type as X.
 
     Notes:
                 - RBF bandwidth (sigma): if provided, it overrides the heuristic and must
@@ -228,9 +230,25 @@ def construct_design_matrix_with_no_pretraining(
                 f"Unsupported radial_basis_function: {radial_basis_function}"
             )
 
-    # Construct P: shape (l, m*n) with column order k varying fastest inside each centre j
-    # Broadcast multiply then reshape
-    p_t = (phi.unsqueeze(-1) * X_t.unsqueeze(1)).reshape(l, m * n)
+    # Construct P: shape (l, (n+1)*(m+1))
+    # For each function φᵢ (i=0..n), we have (m+1) columns: [global, center1, ..., centerₘ]
+    ones_col = torch.ones(l, 1, device=X_t.device, dtype=X_t.dtype)  # Global terms
+
+    # Build the design matrix function by function
+    P_blocks = []
+
+    # φ₀(X) - constant function: [1, Ψ₁(X), Ψ₂(X), ..., Ψₘ(X)]
+    phi_0_block = torch.cat([ones_col, phi], dim=1)  # Shape: (l, m+1)
+    P_blocks.append(phi_0_block)
+
+    # φᵢ(X) - coefficient functions for i=1..n: [Xᵢ, Xᵢ*Ψ₁(X), Xᵢ*Ψ₂(X), ..., Xᵢ*Ψₘ(X)]
+    for i in range(n):
+        X_i = X_t[:, i : i + 1]  # Shape: (l, 1)
+        phi_i_block = torch.cat([X_i, X_i * phi], dim=1)  # Shape: (l, m+1)
+        P_blocks.append(phi_i_block)
+
+    # Concatenate all blocks horizontally
+    p_t = torch.cat(P_blocks, dim=1)  # Shape: (l, (n+1)*(m+1))
 
     if return_numpy:
         # Match NumPy dtype to input's float kind
@@ -253,28 +271,29 @@ def construct_design_matrix_with_local_pretraining(
     """Build the design matrix P for the "first approach" (locally pre-trained).
 
     For each candidate centre j, fit a local linear model w_j in R^n by a
-    weighted least squares problem: minimize sum_i phi_{i,j} (d_i - X_i·w)^2.
-    Then the j-th column of the design matrix is
-        P[:, j] = phi[:, j] ⊙ (X @ w_j).
+    weighted least squares problem: minimize sum_i phi_{i,j} (d_i - X_i·w_j - c_j)^2.
+    The design matrix includes both the local linear predictions and constant terms:
+        P[:, j] = phi[:, j] ⊙ (X @ w_j) for j=0..m-1 (local linear models)
+        P[:, m] = sum_j phi[:, j] (global constant term)
 
-    This yields P in R^{l x m}, so optimizers can select centres with scalar
-    weights.
+    This yields P in R^{l x m+1}, where the last column represents the constant term.
 
     Args:
         X: Input matrix of shape (l, n).
         d: Target vector of shape (l,).
         centres: Centre matrix of shape (m, n). These centres are used directly.
-        weights: Optional pre-computed weights of shape (m, n). If provided, skips local training
-            and uses these weights to construct P directly (useful for test set construction).
+        weights: Optional pre-computed weights of shape (m, n+1). If provided, skips local training
+            and uses these weights to construct P directly. The weights should include both
+            linear coefficients (first n entries) and constant terms (last entry) for each centre.
         radial_basis_function: RBF type used to build phi.
         sigma: Optional bandwidth; if None, median-heuristic is used.
         ridge: Small non-negative Tikhonov regularization to stabilize WLS.
         rho: Non-negative threshold for local support; points with RBF activation
             below rho are ignored in the local fit. Default 0.05.
-        return_weights: If True, also return the local model weights of shape (m, n).
+        return_weights: If True, also return the local model weights of shape (m, n+1).
 
     Returns:
-        P with shape (l, m), same array/tensor type as X.
+        P with shape (l, m+1), same array/tensor type as X.
         If return_weights=True, returns (P, weights) tuple.
     """
     if not isinstance(X, (torch.Tensor, np.ndarray)):
@@ -376,23 +395,48 @@ def construct_design_matrix_with_local_pretraining(
             weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
         else:
             weights_t = weights.to(device=device, dtype=dtype)
-        if weights_t.shape != (m, n):
-            raise ValueError(f"weights must have shape (m, n) = ({m}, {n})")
-        P = phi * (X_t @ weights_t.T)  # (l, m)
+        if weights_t.shape != (m, n + 1):
+            raise ValueError(f"weights must have shape (m, n+1) = ({m}, {n + 1})")
+        # Split weights into linear coefficients and constant terms
+        linear_weights = weights_t[:, :n]  # (m, n)
+        constant_weights = weights_t[:, n]  # (m,)
+
+        # Construct P: local linear models + global constant term
+        P_local = phi * (X_t @ linear_weights.T)  # (l, m)
+        P_constant = (phi * constant_weights.unsqueeze(0)).sum(
+            dim=1, keepdim=True
+        )  # (l, 1)
+        P = torch.cat([P_local, P_constant], dim=1)  # (l, m+1)
     else:
-        # Compute weights through local training
-        eye = torch.eye(n, device=device, dtype=dtype)
+        # Compute weights through local training with augmented design matrix
+        # Augment X with ones column for constant terms: X_aug = [X, 1]
+        ones_col = torch.ones(l, 1, device=device, dtype=dtype)
+        X_aug = torch.cat([X_t, ones_col], dim=1)  # (l, n+1)
+
+        eye_aug = torch.eye(n + 1, device=device, dtype=dtype)
         # Vectorized computation to replace the loop
         Xi_mask = torch.where(
             phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
         )  # (l, m)
-        X_masked_out = Xi_mask.unsqueeze(-1) * X_t.unsqueeze(1)  # (l, m, n)
-        a = torch.einsum("lmi, lj -> mij", X_masked_out, X_t) + ridge * eye.unsqueeze(
+        X_masked_out = Xi_mask.unsqueeze(-1) * X_aug.unsqueeze(1)  # (l, m, n+1)
+        a = torch.einsum(
+            "lmi, lmj -> mij", X_masked_out, X_masked_out
+        ) + ridge * eye_aug.unsqueeze(
             0
-        )  # (m, n, n)
-        b = torch.einsum("lmi, l -> mi", X_masked_out, d_t)  # (m, n)
-        nu_hat = torch.linalg.solve(a, b)  # (m, n)
-        P = phi * (X_t @ nu_hat.T)  # (l, m)
+        )  # (m, n+1, n+1)
+        b = torch.einsum("lmi, l -> mi", X_masked_out, d_t)  # (m, n+1)
+        nu_hat = torch.linalg.lstsq(a, b).solution  # (m, n+1)
+
+        # Split the fitted weights
+        linear_weights = nu_hat[:, :n]  # (m, n)
+        constant_weights = nu_hat[:, n]  # (m,)
+
+        # Construct P: local linear models + global constant term
+        P_local = phi * (X_t @ linear_weights.T)  # (l, m)
+        P_constant = (phi * constant_weights.unsqueeze(0)).sum(
+            dim=1, keepdim=True
+        )  # (l, 1)
+        P = torch.cat([P_local, P_constant], dim=1)  # (l, m+1)
 
     if return_numpy:
         np_dtype = np.float64 if dtype == torch.float64 else np.float32
