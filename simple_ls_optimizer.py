@@ -63,8 +63,13 @@ class SimpleLSOptimizer(Optimizer):
 
         nu_hat = torch.linalg.lstsq(P_aug, d_aug).solution
 
-        # selected_indices = torch.arange(P.shape[1])
-        selected_indices = torch.nonzero(torch.abs(nu_hat) < self._delta).squeeze()
+        # Apply sparsity threshold to select significant parameters
+        abs_w = torch.abs(nu_hat)
+        selected_indices = torch.nonzero(abs_w > self._delta, as_tuple=True)[0]
+
+        # If no parameters pass the threshold, select all (fallback)
+        if len(selected_indices) == 0:
+            selected_indices = torch.arange(P.shape[1], device=P.device)
 
         return (
             (selected_indices, nu_hat[selected_indices])

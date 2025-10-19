@@ -275,17 +275,28 @@ def run_proposed_experiment(
 
     if config.post_tune:
         if config.approach in ["local_pretraining", "pretraining"]:
-            # For pretraining approach: only tune the weights, not centers or sigma
-            # The weights here are already the final weights for each center
+            # For pretraining approach: selected_indices refer to center indices
+            # Design matrix shape: (l, m+1) where m+1 includes m centers + 1 global term
 
             adjustable_weights = model_weights.clone().detach().requires_grad_(True)
-            selected_centres = centers[selected_indices]
-            nu_hat_train_for_selected_centres = nu_hat_train[selected_indices]
 
-            if adjustable_weights.shape[0] != selected_centres.shape[0]:
-                raise ValueError(
-                    "Mismatch between adjustable weights and selected centres."
-                )
+            # Map selected indices to centers and pretraining weights
+            # Handle the case where selected_indices might include the global term (last index)
+            max_center_idx = centers.shape[0] - 1
+            center_mask = selected_indices <= max_center_idx
+            center_indices = selected_indices[center_mask]
+
+            # Select corresponding centers and pretraining weights
+            if len(center_indices) > 0:
+                selected_centres = centers[center_indices]
+                nu_hat_train_for_selected_centres = nu_hat_train[center_indices]
+            else:
+                # Fallback: use all centers if no centers are selected
+                selected_centres = centers
+                nu_hat_train_for_selected_centres = nu_hat_train
+                center_indices = torch.arange(centers.shape[0])
+                # Update selected_indices to include all centers
+                selected_indices = center_indices
 
             # Post-tune using Adam with early stopping
             optim = torch.optim.Adam(
@@ -304,12 +315,12 @@ def run_proposed_experiment(
             d_train_for_tuning = d_train[:train_size]
             d_valid_for_tuning = d_train[train_size:]
 
-            # For pretraining, we need to reconstruct the design matrices with the learned weights
+            # For pretraining, use only the selected centers for tuning
             P_train_for_tuning = construct_design_matrix_with_local_pretraining(
                 X_train_for_tuning,
                 d_train_for_tuning,  # Not used when weights are provided
-                centres=selected_centres,  # Use the correct variable name
-                weights=nu_hat_train_for_selected_centres,  # Use the pretraining weights
+                centres=selected_centres,
+                weights=nu_hat_train_for_selected_centres,
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
@@ -317,8 +328,8 @@ def run_proposed_experiment(
             P_valid_for_tuning = construct_design_matrix_with_local_pretraining(
                 X_valid_for_tuning,
                 d_valid_for_tuning,  # Not used when weights are provided
-                centres=selected_centres,  # Use the correct variable name
-                weights=nu_hat_train_for_selected_centres,  # Use the pretraining weights
+                centres=selected_centres,
+                weights=nu_hat_train_for_selected_centres,
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
@@ -354,7 +365,7 @@ def run_proposed_experiment(
             # Restore best weights
             adjustable_weights.data = best_weights.data
 
-            # Generate predictions using tuned weights
+            # Generate predictions using tuned weights on selected centers only
             with torch.no_grad():
                 train_pred = (
                     (P_train[:, selected_indices] @ adjustable_weights)
@@ -392,21 +403,43 @@ def run_proposed_experiment(
                 return phi
 
             def _construct_design_matrix(X_in, centers_in, log_sigma):
-                """Construct the full design matrix P (l, m*n) from X and centers."""
+                """Construct the full design matrix P (l, (n+1)*(m+1)) from X and centers."""
                 phi = _phi_from_params(X_in, centers_in, log_sigma)  # (l, m)
-                # P[i, j*n + k] = phi[i, j] * X[i, k]
                 l, n = X_in.shape
                 m = centers_in.shape[0]
-                P = (phi.unsqueeze(-1) * X_in.unsqueeze(1)).reshape(l, m * n)
+
+                # Build design matrix with new structure: (n+1) functions × (m+1) parameters
+                ones_col = torch.ones(
+                    l, 1, device=X_in.device, dtype=X_in.dtype
+                )  # Global terms
+
+                # Build the design matrix function by function
+                P_blocks = []
+
+                # φ₀(X) - constant function: [1, Ψ₁(X), Ψ₂(X), ..., Ψₘ(X)]
+                phi_0_block = torch.cat([ones_col, phi], dim=1)  # Shape: (l, m+1)
+                P_blocks.append(phi_0_block)
+
+                # φᵢ(X) - coefficient functions for i=1..n: [Xᵢ, Xᵢ*Ψ₁(X), Xᵢ*Ψ₂(X), ..., Xᵢ*Ψₘ(X)]
+                for i in range(n):
+                    X_i = X_in[:, i : i + 1]  # Shape: (l, 1)
+                    phi_i_block = torch.cat([X_i, X_i * phi], dim=1)  # Shape: (l, m+1)
+                    P_blocks.append(phi_i_block)
+
+                # Concatenate all blocks horizontally
+                P = torch.cat(P_blocks, dim=1)  # Shape: (l, (n+1)*(m+1))
                 return P
 
             # Create adjustable parameters - only tune centers, weights, and sigma
             adjustable_centers = centers.clone().detach().requires_grad_(True)
 
-            # For no-pretraining, we need to create a full weight vector (m*n,)
+            # For no-pretraining, we need to create a full weight vector ((n+1)*(m+1),)
             # The optimizer gave us weights only for selected indices
             m, n = adjustable_centers.shape[0], X_train.shape[1]
-            full_weights = torch.zeros(m * n, device=device, dtype=model_weights.dtype)
+            total_params = (n + 1) * (m + 1)
+            full_weights = torch.zeros(
+                total_params, device=device, dtype=model_weights.dtype
+            )
             full_weights[selected_indices] = model_weights
             adjustable_weights = full_weights.clone().detach().requires_grad_(True)
 
