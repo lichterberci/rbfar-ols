@@ -113,17 +113,19 @@ class EMVPModel:
         features = _gaussian_activations(X, centres, widths)  # (N, m)
 
         # Compute local predictions for each component (vectorized)
-        local_means = _compute_local_means(X, features, function_params)  # (N, num_components)
+        local_means = _compute_local_means(
+            X, features, function_params
+        )  # (N, num_components)
 
         # Compute gating weights and final prediction
         log_mixing = torch.log(mixing + 1e-12)  # (K,)
         log_features = torch.log(features + 1e-12)  # (N, m)
-        
+
         # For each component k: log(π_k) + Σⱼ log(Ψⱼ(X))
         log_features_sum = log_features.sum(dim=1)  # (N,) - sum over RBF centers
         log_gating = log_mixing.unsqueeze(0) + log_features_sum.unsqueeze(1)  # (N, K)
         weights_resp = torch.softmax(log_gating, dim=1)  # (N, K)
-        
+
         predictions = (weights_resp * local_means).sum(dim=1)
         return predictions
 
@@ -356,30 +358,32 @@ def _compute_local_means(
 
     # Vectorized computation: avoid loops over components and features
     # Create extended features: [1, Ψ₁, Ψ₂, ..., Ψₘ] for all samples
-    features_ext = torch.cat([torch.ones(N, 1, device=X.device, dtype=X.dtype), features], dim=1)  # (N, m+1)
-    
+    features_ext = torch.cat(
+        [torch.ones(N, 1, device=X.device, dtype=X.dtype), features], dim=1
+    )  # (N, m+1)
+
     # Compute all φᵢ(X) values at once for all components
     # φᵢ(X) = νᵢ,₀ + Σⱼ νᵢ,ⱼ Ψⱼ(X) = features_ext @ function_params[k, i, :]
-    
+
     # Reshape for batch matrix multiplication
     # function_params: (K, n+1, m+1) -> (K*(n+1), m+1)
     params_flat = function_params.view(-1, m + 1)  # (K*(n+1), m+1)
-    
+
     # Compute all φᵢᵏ(X) values: (N, K*(n+1))
     phi_all = features_ext @ params_flat.T  # (N, K*(n+1))
-    
+
     # Reshape back to (N, K, n+1)
     phi_reshaped = phi_all.view(N, num_components, n + 1)  # (N, K, n+1)
-    
+
     # Extract φ₀ (constant terms) and φᵢ (coefficient terms)
     phi_0 = phi_reshaped[:, :, 0]  # (N, K)
     phi_coeffs = phi_reshaped[:, :, 1:]  # (N, K, n)
-    
+
     # Compute coefficient contributions: Σᵢ φᵢ(X) * Xᵢ
     # X: (N, n) -> (N, 1, n), phi_coeffs: (N, K, n)
     X_expanded = X.unsqueeze(1)  # (N, 1, n)
     coeff_contributions = (X_expanded * phi_coeffs).sum(dim=2)  # (N, K)
-    
+
     # Final local means: φ₀ + Σᵢ φᵢ(X) * Xᵢ
     local_means = phi_0 + coeff_contributions  # (N, K)
 
@@ -402,7 +406,7 @@ def _gaussian_activations(X: Tensor, centres: Tensor, widths: Tensor) -> Tensor:
     # Use torch.cdist for efficient pairwise distance computation
     dists = torch.cdist(X, centres, p=2)  # (N, m)
     widths_sq = torch.clamp(widths, min=1e-12) ** 2
-    return torch.exp(-dists ** 2 / (2.0 * widths_sq.unsqueeze(0)))
+    return torch.exp(-(dists**2) / (2.0 * widths_sq.unsqueeze(0)))
 
 
 def _log_normal_pdf(
@@ -472,52 +476,56 @@ def _update_function_params(
     # Pre-compute design matrix once (this was the main bottleneck)
     ones_col = torch.ones(N, 1, device=X.device, dtype=X.dtype)
     features_ext = torch.cat([ones_col, features], dim=1)  # (N, m+1)
-    
+
     # Efficiently build the full design matrix using broadcasting
     # φ₀ terms: [1, Ψ₁, Ψ₂, ..., Ψₘ]
     phi_0_design = features_ext  # (N, m+1)
-    
+
     # φᵢ terms for i=1..n: [Xᵢ, Xᵢ*Ψ₁, Xᵢ*Ψ₂, ..., Xᵢ*Ψₘ]
     # Use broadcasting: X.unsqueeze(2) * features_ext.unsqueeze(1)
     X_ext = X.unsqueeze(2)  # (N, n, 1)
     features_broadcast = features_ext.unsqueeze(1)  # (N, 1, m+1)
     phi_coeff_designs = X_ext * features_broadcast  # (N, n, m+1)
-    
+
     # Reshape to (N, n*(m+1))
     phi_coeff_designs_flat = phi_coeff_designs.view(N, n * (m + 1))
-    
+
     # Full design matrix: [φ₀_terms, φ₁_terms, ..., φₙ_terms]
-    full_design = torch.cat([phi_0_design, phi_coeff_designs_flat], dim=1)  # (N, (n+1)*(m+1))
+    full_design = torch.cat(
+        [phi_0_design, phi_coeff_designs_flat], dim=1
+    )  # (N, (n+1)*(m+1))
 
     function_params_new = torch.zeros_like(current_function_params)
-    
+
     # Batch solve for all components using vectorized operations
-    sqrt_responsibilities = torch.sqrt(responsibilities.clamp_min(cfg.responsibility_floor))  # (N, K)
-    
+    sqrt_responsibilities = torch.sqrt(
+        responsibilities.clamp_min(cfg.responsibility_floor)
+    )  # (N, K)
+
     # Vectorized weighted design matrix computation
     # sqrt_responsibilities: (N, K) -> (N, K, 1)
     sqrt_resp_expanded = sqrt_responsibilities.unsqueeze(2)  # (N, K, 1)
-    # full_design: (N, D) -> (N, 1, D) 
+    # full_design: (N, D) -> (N, 1, D)
     design_expanded = full_design.unsqueeze(1)  # (N, 1, D)
     # Weighted design for all components: (N, K, D)
     weighted_designs = sqrt_resp_expanded * design_expanded  # (N, K, D)
-    
+
     # Weighted targets for all components: (N, K)
     y_squeezed = y.squeeze()  # (N,)
     weighted_targets = sqrt_responsibilities * y_squeezed.unsqueeze(1)  # (N, K)
-    
+
     D = full_design.shape[1]  # (n+1)*(m+1)
     ridge_eye = ridge * torch.eye(D, device=X.device, dtype=X.dtype)
-    
+
     for k in range(num_components):
         # Extract weighted design and targets for component k
         weighted_design_k = weighted_designs[:, k, :]  # (N, D)
         weighted_y_k = weighted_targets[:, k]  # (N,)
-        
+
         # Normal equations: (D^T D + λI) θ = D^T y
         AtA = weighted_design_k.T @ weighted_design_k + ridge_eye  # (D, D)
         Atb = weighted_design_k.T @ weighted_y_k  # (D,)
-        
+
         # Solve and reshape
         params_flat = torch.linalg.lstsq(AtA, Atb).solution  # (D,)
         function_params_new[k] = params_flat.reshape(n + 1, m + 1)
