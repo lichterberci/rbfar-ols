@@ -22,6 +22,7 @@ from design_matrix_constructor import (
     construct_design_matrix_with_local_pretraining,
     construct_design_matrix_with_no_pretraining,
     estimate_sigma_median,
+    select_centres_kmeans,
 )
 from dimension_estimation import (
     CaoEstimator,
@@ -74,6 +75,17 @@ class ProposedMethodConfig(ExperimentConfig):
 
     # RBF parameters
     m: int = 100  # number of candidate centres
+
+    # Centre selection parameters
+    use_kmeans_centres: bool = (
+        False  # if True, use K-means for centre selection instead of random
+    )
+    kmeans_max_iters: int = 100  # maximum iterations for K-means clustering
+    kmeans_tol: float = 1e-4  # tolerance for K-means convergence
+
+    # Sigma estimation parameters
+    use_local_sigma: bool = False  # if True, use local KNN-based sigma estimation
+    local_sigma_k: int = 5  # number of nearest neighbors for local sigma estimation
 
     # Method-specific parameters
     ridge: float = 1e-4  # only for local_pretraining
@@ -227,10 +239,21 @@ def run_proposed_experiment(
     if sigma_val is None:
         sigma_val = estimate_sigma_median(X_train.numpy())
 
-    train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
-        : min(config.m, X_train.shape[0])
-    ]
-    centers = X_train[train_candidates]
+    # Centre selection based on configuration
+    if config.use_kmeans_centres:
+        # Use K-means for centre selection
+        centers = select_centres_kmeans(
+            X_train,
+            m=min(config.m, X_train.shape[0]),
+            max_iters=config.kmeans_max_iters,
+            tol=config.kmeans_tol,
+        )
+    else:
+        # Use random centre selection (original method)
+        train_candidates = torch.randperm(X_train.shape[0], dtype=torch.long)[
+            : min(config.m, X_train.shape[0])
+        ]
+        centers = X_train[train_candidates]
 
     # Construct design matrix
     if config.approach in ["local_pretraining", "pretraining"]:
@@ -240,6 +263,8 @@ def run_proposed_experiment(
             d_train,
             centres=centers,
             sigma=sigma_val,
+            use_local_sigma=config.use_local_sigma,
+            local_sigma_k=config.local_sigma_k,
             radial_basis_function=config.rbf,
             ridge=config.ridge,
             rho=config.rho,
@@ -252,12 +277,15 @@ def run_proposed_experiment(
             centres=centers,
             weights=nu_hat_train,  # Use the pretraining weights
             sigma=sigma_val,
+            use_local_sigma=config.use_local_sigma,
+            local_sigma_k=config.local_sigma_k,
             radial_basis_function=config.rbf,
+            rho=config.rho,
             return_weights=False,
         )
 
     else:  # no_pretraining
-        if train_candidates.shape[0] == 0:
+        if centers.shape[0] == 0:
             raise ValueError("Not enough training samples to select centres.")
         lt = X_test.shape[0]  # length of test set
         P_stack = construct_design_matrix_with_no_pretraining(
@@ -275,16 +303,28 @@ def run_proposed_experiment(
 
     if config.post_tune:
         if config.approach in ["local_pretraining", "pretraining"]:
-            # For pretraining approach: selected_indices refer to center indices
-            # Design matrix shape: (l, m+1) where m+1 includes m centers + 1 global term
-
-            adjustable_weights = model_weights.clone().detach().requires_grad_(True)
 
             # Map selected indices to centers and pretraining weights
-            # Handle the case where selected_indices might include the global term (last index)
-            max_center_idx = centers.shape[0] - 1
-            center_mask = selected_indices <= max_center_idx
+            # Handle the case where selected_indices might include the constant term (last index)
+            # Design matrix shape: (l, m+1) where m+1 includes m centers + 1 constant term
+            # The centers array has shape (m, n), so valid center indices are 0 to m-1
+            # The constant term corresponds to index m in the design matrix
+            m = centers.shape[0]
+
+            # Separate center indices from constant term index
+            # Filter out the constant term index if it exists
+            center_mask = selected_indices < m
             center_indices = selected_indices[center_mask]
+
+            # Check if constant term is selected
+            constant_term_selected = (selected_indices >= m).any()
+            center_indices = selected_indices[center_mask]
+
+            # Check if constant term is selected
+            constant_term_selected = torch.any(selected_indices == m)
+
+            # For pretraining approach: selected_indices refer to center indices
+            adjustable_weights = model_weights.clone().detach().requires_grad_(True)
 
             # Select corresponding centers and pretraining weights
             if len(center_indices) > 0:
@@ -324,6 +364,7 @@ def run_proposed_experiment(
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
+                rho=config.rho,
             )
             P_valid_for_tuning = construct_design_matrix_with_local_pretraining(
                 X_valid_for_tuning,
@@ -333,11 +374,38 @@ def run_proposed_experiment(
                 sigma=sigma_val,
                 radial_basis_function=config.rbf,
                 return_weights=False,
+                rho=config.rho,
             )
+            P_test_for_tuning = construct_design_matrix_with_local_pretraining(
+                X_test,
+                d_test,  # Not used when weights are provided
+                centres=selected_centres,
+                weights=nu_hat_train_for_selected_centres,
+                sigma=sigma_val,
+                radial_basis_function=config.rbf,
+                return_weights=False,
+                rho=config.rho,
+            )
+
+            # Create new indices for the tuning matrices
+            # The tuning matrices have shape (l, len(selected_centres)+1)
+            # We need to map the selected center indices and constant term appropriately
+            num_selected_centers = len(center_indices)
+            tuning_indices = torch.arange(
+                num_selected_centers, device=selected_indices.device
+            )
+            if constant_term_selected:
+                # Add the constant term index (which is the last column in the tuning matrix)
+                constant_idx = torch.tensor(
+                    [num_selected_centers], device=selected_indices.device
+                )
+                tuning_indices = torch.cat([tuning_indices, constant_idx])
 
             for _ in range(config.tuning_max_epochs):
                 # Training step
-                pred = (P_train_for_tuning @ adjustable_weights).squeeze()
+                pred = (
+                    P_train_for_tuning[:, tuning_indices] @ adjustable_weights
+                ).squeeze()
                 loss = torch.mean(
                     (pred - d_train_for_tuning) ** 2
                 )  # TODO: regularization (L2?)
@@ -348,7 +416,9 @@ def run_proposed_experiment(
 
                 # Validation step
                 with torch.no_grad():
-                    val_pred = (P_valid_for_tuning @ adjustable_weights).squeeze()
+                    val_pred = (
+                        P_valid_for_tuning[:, tuning_indices] @ adjustable_weights
+                    ).squeeze()
                     val_loss = torch.mean((val_pred - d_valid_for_tuning) ** 2)
 
                 # Early stopping based on validation loss
@@ -367,14 +437,15 @@ def run_proposed_experiment(
 
             # Generate predictions using tuned weights on selected centers only
             with torch.no_grad():
+                # Use the same mapping as used during training
                 train_pred = (
-                    (P_train[:, selected_indices] @ adjustable_weights)
+                    (P_train_for_tuning[:, tuning_indices] @ adjustable_weights)
                     .squeeze()
                     .cpu()
                     .numpy()
                 )
                 test_pred = (
-                    (P_test[:, selected_indices] @ adjustable_weights)
+                    (P_test_for_tuning[:, tuning_indices] @ adjustable_weights)
                     .squeeze()
                     .cpu()
                     .numpy()
@@ -528,12 +599,16 @@ def run_proposed_experiment(
                 )  # (l_te, m*n)
                 test_pred = (P_te @ adjustable_weights).squeeze().cpu().numpy()
     else:  # no post-tuning
-        train_pred = (
-            (P_train[:, selected_indices] @ model_weights).squeeze().cpu().numpy()
-        )
-        test_pred = (
-            (P_test[:, selected_indices] @ model_weights).squeeze().cpu().numpy()
-        )
+        # Handle the constant term index issue for non-post-tuning case
+        if config.approach in ["local_pretraining", "pretraining"]:
+            # The same logic applies: selected_indices may include constant term index
+            m = centers.shape[0] if "centers" in locals() else P_train.shape[1] - 1
+            safe_indices = selected_indices[selected_indices <= P_train.shape[1] - 1]
+        else:
+            safe_indices = selected_indices
+
+        train_pred = (P_train[:, safe_indices] @ model_weights).squeeze().cpu().numpy()
+        test_pred = (P_test[:, safe_indices] @ model_weights).squeeze().cpu().numpy()
 
     metadata = {
         "tau": tau,
@@ -654,8 +729,6 @@ def _run_control_with_gradient_descent(
     d_train_split = d_train[:train_size]
     X_val_split = X_train[train_size:]
     d_val_split = d_train[train_size:]
-
-    torch.manual_seed(0)
 
     if X_train_split.shape[0] == 0:
         raise ValueError(

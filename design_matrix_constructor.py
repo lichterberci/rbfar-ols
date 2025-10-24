@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 import numpy as np
 from enum import StrEnum, auto
@@ -69,6 +69,159 @@ def estimate_sigma_median(
     if not torch.isfinite(sigma_t):
         sigma_t = torch.tensor(1.0, device=device, dtype=dtype)
     return torch.clamp(sigma_t, min=torch.finfo(dtype).eps)
+
+
+def select_centres_kmeans(
+    X: torch.Tensor | np.ndarray,
+    m: int,
+    max_iters: int = 100,
+    tol: float = 1e-4,
+) -> torch.Tensor:
+    """Select centres using K-means clustering.
+
+    Args:
+        X: Input matrix of shape (l, n). Torch tensor or NumPy array.
+        m: Number of centres to select.
+        max_iters: Maximum number of K-means iterations.
+        tol: Convergence tolerance for K-means.
+
+    Returns:
+        Centres tensor of shape (m, n), same type/device as X.
+    """
+    if not isinstance(X, (torch.Tensor, np.ndarray)):
+        raise TypeError("X must be a torch.Tensor or numpy.ndarray")
+
+    # Unify to torch for computation
+    if isinstance(X, torch.Tensor):
+        device = X.device
+        dtype = X.dtype if X.dtype.is_floating_point else torch.get_default_dtype()
+        X_t = X.to(device=device, dtype=dtype)
+        return_numpy = False
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float64 if X.dtype == np.float64 else torch.float32
+        X_t = torch.from_numpy(X).to(device=device, dtype=dtype)
+        return_numpy = True
+
+    if X_t.ndim != 2:
+        raise ValueError("X must be 2D (l, n)")
+    l, n = X_t.shape
+
+    if m <= 0:
+        raise ValueError("m must be positive")
+    if m > l:
+        raise ValueError(f"Cannot select {m} centres from {l} points")
+
+    # Initialize centres randomly
+    init_indices = torch.randperm(l, device=device)[:m]
+    centres = X_t[init_indices].clone()
+
+    for _ in range(max_iters):
+        # Assign each point to closest centre
+        dist_sq = torch.cdist(X_t, centres, p=2) ** 2  # (l, m)
+        assignments = torch.argmin(dist_sq, dim=1)  # (l,)
+
+        # Update centres
+        new_centres = torch.zeros_like(centres)
+        for k in range(m):
+            mask = assignments == k
+            if mask.sum() > 0:
+                new_centres[k] = X_t[mask].mean(dim=0)
+            else:
+                # If no points assigned, keep the old centre
+                new_centres[k] = centres[k]
+
+        # Check convergence
+        centre_shift = torch.norm(new_centres - centres, dim=1).max()
+        centres = new_centres.clone()
+
+        if centre_shift < tol:
+            break
+
+    if return_numpy:
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        return centres.cpu().numpy().astype(np_dtype, copy=False)
+    return centres
+
+
+def estimate_local_sigma_knn(
+    centres: torch.Tensor | np.ndarray,
+    k: int = 5,
+) -> torch.Tensor:
+    """Estimate local sigma for each centre using KNN metric.
+
+    For each centre C_j, computes:
+    σ_j = (1/√2) * (1/k) * Σ_{i=1}^k ||C_j - C_{NN_i}||_2
+
+    where C_{NN_i} are the k nearest neighbors of centre C_j.
+
+    Args:
+        centres: Centre matrix of shape (m, n). Torch tensor or NumPy array.
+        k: Number of nearest neighbors to use for estimation.
+
+    Returns:
+        Local sigma values of shape (m,), same type/device as centres.
+    """
+    if not isinstance(centres, (torch.Tensor, np.ndarray)):
+        raise TypeError("centres must be a torch.Tensor or numpy.ndarray")
+
+    # Unify to torch for computation
+    if isinstance(centres, torch.Tensor):
+        device = centres.device
+        dtype = (
+            centres.dtype
+            if centres.dtype.is_floating_point
+            else torch.get_default_dtype()
+        )
+        centres_t = centres.to(device=device, dtype=dtype)
+        return_numpy = False
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float64 if centres.dtype == np.float64 else torch.float32
+        centres_t = torch.from_numpy(centres).to(device=device, dtype=dtype)
+        return_numpy = True
+
+    if centres_t.ndim != 2:
+        raise ValueError("centres must be 2D (m, n)")
+    m, n = centres_t.shape
+
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if k >= m:
+        # If we don't have enough centres, use all available ones
+        k = max(1, m - 1)
+
+    # Handle the case of a single centre
+    if m == 1:
+        # Return a small but positive sigma for the single centre
+        sigma_val = torch.tensor(1, device=device, dtype=dtype).unsqueeze(0)
+        if return_numpy:
+            np_dtype = np.float64 if dtype == torch.float64 else np.float32
+            return sigma_val.cpu().numpy().astype(np_dtype, copy=False)
+        return sigma_val
+
+    # Compute pairwise distances between all centres
+    dist = torch.cdist(centres_t, centres_t, p=2)  # (m, m)
+
+    # For each centre, find k nearest neighbors (excluding itself)
+    # Sort distances and take the k+1 smallest (excluding the 0 distance to itself)
+    sorted_dists, _ = torch.sort(dist, dim=1)  # (m, m)
+    knn_dists = sorted_dists[:, 1 : k + 1]  # (m, k) - exclude self-distance
+
+    # Compute local sigma for each centre
+    local_sigmas = (
+        1.0 / torch.sqrt(torch.tensor(2.0, device=device, dtype=dtype))
+    ) * torch.mean(
+        knn_dists, dim=1
+    )  # (m,)
+
+    # Ensure we don't get zero or very small sigmas
+    local_sigmas = torch.clamp(local_sigmas, min=torch.finfo(dtype).eps * 100)
+
+    if return_numpy:
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        return local_sigmas.cpu().numpy().astype(np_dtype, copy=False)
+    return local_sigmas
 
 
 def construct_design_matrix_with_no_pretraining(
@@ -264,6 +417,8 @@ def construct_design_matrix_with_local_pretraining(
     weights: Optional[torch.Tensor | np.ndarray] = None,
     radial_basis_function: RadialBasisFunction = RadialBasisFunction.GAUSSIAN,
     sigma: Optional[float | int | torch.Tensor | np.ndarray] = None,
+    use_local_sigma: bool = False,
+    local_sigma_k: int = 5,
     ridge: float = 1e-8,
     rho: float = 0.05,
     return_weights: bool = False,
@@ -286,7 +441,10 @@ def construct_design_matrix_with_local_pretraining(
             and uses these weights to construct P directly. The weights should include both
             linear coefficients (first n entries) and constant terms (last entry) for each centre.
         radial_basis_function: RBF type used to build phi.
-        sigma: Optional bandwidth; if None, median-heuristic is used.
+        sigma: Optional bandwidth; if None, median-heuristic is used. If use_local_sigma=True,
+            this parameter is ignored and local sigmas are computed instead.
+        use_local_sigma: If True, compute local sigma values for each centre using KNN.
+        local_sigma_k: Number of nearest neighbors for local sigma estimation.
         ridge: Small non-negative Tikhonov regularization to stabilize WLS.
         rho: Non-negative threshold for local support; points with RBF activation
             below rho are ignored in the local fit. Default 0.05.
@@ -351,40 +509,62 @@ def construct_design_matrix_with_local_pretraining(
     dist_sq = (x_sq + centres_sq.unsqueeze(0)) - 2.0 * (X_t @ centres_t.transpose(0, 1))
     dist_sq = torch.clamp(dist_sq, min=0.0)
 
-    # Sigma
-    if sigma is None:
-        # Use centres for sigma estimation
-        sigma_t = estimate_sigma_median(
-            X_t, None
-        )  # Use all points for sigma estimation
-    else:
-        if isinstance(sigma, torch.Tensor):
-            if sigma.numel() != 1:
-                raise ValueError("sigma must be a positive scalar")
-            sigma_t = sigma.to(device=device, dtype=dtype).reshape(())
-        elif isinstance(sigma, np.ndarray):
-            if np.asarray(sigma).size != 1:
-                raise ValueError("sigma must be a positive scalar")
-            sigma_t = torch.as_tensor(
-                float(np.asarray(sigma).item()), device=device, dtype=dtype
-            )
-        else:
-            sigma_t = torch.tensor(float(sigma), device=device, dtype=dtype)
-        if not torch.isfinite(sigma_t) or (sigma_t <= 0):
-            raise ValueError("sigma must be a positive, finite scalar")
+    # Sigma estimation
+    if use_local_sigma:
+        # Use local KNN-based sigma estimation
+        local_sigmas_t = estimate_local_sigma_knn(centres_t, k=local_sigma_k)
 
-    # Phi
-    match radial_basis_function:
-        case RadialBasisFunction.GAUSSIAN:
-            denom = 2.0 * (sigma_t * sigma_t)
-            phi = torch.exp(-dist_sq / denom)
-        case RadialBasisFunction.LAPLACIAN:
-            dist = torch.sqrt(dist_sq + 1e-12)
-            phi = torch.exp(-dist / (sigma_t + torch.finfo(dtype).eps))
-        case _:
-            raise ValueError(
-                f"Unsupported radial_basis_function: {radial_basis_function}"
-            )
+        # Phi computation with local sigmas
+        match radial_basis_function:
+            case RadialBasisFunction.GAUSSIAN:
+                # For each centre j, use sigma_j for computing distances to that centre
+                # dist_sq is (l, m), local_sigmas_t is (m,)
+                denom = 2.0 * (local_sigmas_t * local_sigmas_t).unsqueeze(0)  # (1, m)
+                phi = torch.exp(-dist_sq / denom)  # (l, m)
+            case RadialBasisFunction.LAPLACIAN:
+                dist = torch.sqrt(dist_sq + 1e-12)
+                phi = torch.exp(
+                    -dist / (local_sigmas_t.unsqueeze(0) + torch.finfo(dtype).eps)
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported radial_basis_function: {radial_basis_function}"
+                )
+    else:
+        # Use global sigma estimation
+        if sigma is None:
+            # Use centres for sigma estimation
+            sigma_t = estimate_sigma_median(
+                X_t, None
+            )  # Use all points for sigma estimation
+        else:
+            if isinstance(sigma, torch.Tensor):
+                if sigma.numel() != 1:
+                    raise ValueError("sigma must be a positive scalar")
+                sigma_t = sigma.to(device=device, dtype=dtype).reshape(())
+            elif isinstance(sigma, np.ndarray):
+                if np.asarray(sigma).size != 1:
+                    raise ValueError("sigma must be a positive scalar")
+                sigma_t = torch.as_tensor(
+                    float(np.asarray(sigma).item()), device=device, dtype=dtype
+                )
+            else:
+                sigma_t = torch.tensor(float(sigma), device=device, dtype=dtype)
+            if not torch.isfinite(sigma_t) or (sigma_t <= 0):
+                raise ValueError("sigma must be a positive, finite scalar")
+
+        # Phi computation with global sigma
+        match radial_basis_function:
+            case RadialBasisFunction.GAUSSIAN:
+                denom = 2.0 * (sigma_t * sigma_t)
+                phi = torch.exp(-dist_sq / denom)
+            case RadialBasisFunction.LAPLACIAN:
+                dist = torch.sqrt(dist_sq + 1e-12)
+                phi = torch.exp(-dist / (sigma_t + torch.finfo(dtype).eps))
+            case _:
+                raise ValueError(
+                    f"Unsupported radial_basis_function: {radial_basis_function}"
+                )
 
     if ridge < 0:
         raise ValueError("ridge must be non-negative")
