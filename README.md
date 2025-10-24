@@ -217,16 +217,16 @@ We then get the following equation for the optimal weights:
 
 $$
 \large
-\hat{\nu} = \argmin_{\nu} \{ {\lVert d - P \cdot \nu \rVert }_2^2 + \alpha {\small \lVert \nu \rVert}_2^2 \} ,
+\hat{\nu} = \text{argmin}_{\nu} \{ {\lVert d - P \cdot \nu \rVert }_2^2 + \alpha {\small \lVert \nu \rVert}_2^2 \} ,
 $$
 
 where $\alpha$ is a regularization parameter.  
 We can transform this as follows:
 
 $$
-\begin{align*}
-\hat{\nu} &=  \argmin_{\nu} { \bigl\{ \lVert d - P \cdot \nu \rVert }_2^2 + \alpha{\small \lVert \nu \rVert}_2^2 \} \\
-&= \argmin_{\nu}{\bigl\{d^T d - 2\nu^T P^T d + \nu^T P^T P \nu + \alpha \nu^T \nu\bigr\}}\\
+\begin{aligned}
+\hat{\nu} &=  \text{argmin}_{\nu} { \bigl\{ \lVert d - P \cdot \nu \rVert }_2^2 + \alpha{\small \lVert \nu \rVert}_2^2 \} \\
+&= \text{argmin}_{\nu}{\bigl\{d^T d - 2\nu^T P^T d + \nu^T P^T P \nu + \alpha \nu^T \nu\bigr\}}\\
 \implies \frac{\delta}{\delta \nu} &= -2P^T d + 2P^T P \nu + 2\alpha \nu = 0\\
 \implies \hat{\nu} &= \left(P^T P + \alpha I\right)^{-1} P^T d\\
 &= \left( V \Sigma^T Q^T Q \Sigma V^T + \alpha V V^T \right)^{-1} V \Sigma^T Q^T d \\
@@ -241,7 +241,7 @@ V \text{ is orthogonal}\implies V^T V = I \implies & \hat{\nu} = V \left( \Sigma
 \vdots & \vdots & \ddots & \vdots \\
 0 & 0 & \cdots & \frac{\sigma_n}{\sigma_n^2 + \alpha}
 \end{bmatrix} Q^T d
-\end{align*}\\[20px]
+\end{aligned}\\[20pt]
 \boxed{ \hat{\nu} = V \begin{bmatrix}
 \frac{\sigma_1}{\sigma_1^2 + \alpha} & 0 & \cdots & 0 \\
 0 & \frac{\sigma_2}{\sigma_2^2 + \alpha} & \cdots & 0 \\
@@ -253,7 +253,7 @@ $$
 This means that:
 
 $$
-\begin{align*}
+\begin{aligned}
 y &= P \hat{\nu}\\ 
 &= Q \Sigma V^T \hat{\nu} \\ 
 &= Q \Sigma V^T V \begin{bmatrix}
@@ -274,13 +274,13 @@ y &= P \hat{\nu}\\
 \vdots & \vdots & \ddots & \vdots \\
 0 & 0 & \cdots & \frac{\sigma_n^2}{\sigma_n^2 + \alpha}
 \end{bmatrix} Q^T d
-\end{align*}
+\end{aligned}
 $$
 
 Let $\sigma_i' = \frac{\sigma_i^2}{\sigma_i^2 + \alpha}$, and let $\Sigma'$ be defined as follows:
 
 $$
-\begin{align*}
+\begin{aligned}
 \Sigma' &= \begin{bmatrix}
 \frac{\sigma_1^2}{\sigma_1^2 + \alpha} & 0 & \cdots & 0 \\
 0 & \frac{\sigma_2^2}{\sigma_2^2 + \alpha} & \cdots & 0 \\
@@ -293,7 +293,7 @@ $$
 \vdots & \vdots & \ddots & \vdots \\
 0 & 0 & \cdots & \sigma_n'
 \end{bmatrix}
-\end{align*}
+\end{aligned}
 $$
 
 Thus we get:
@@ -307,10 +307,10 @@ $$
 We iteratively select the first $k$ columns of $Q$ and $\Sigma'$, which correspond to the $k$ largest singular values. This gives us a reduced representation of the data, focusing on the most important features. We then calculate the corresponding error and stop when the error is below a certain threshold.
 
 $$
-\begin{align*}
+\begin{aligned}
 \text{Error} &= \lVert d - P \hat{\nu} \rVert_2^2 \\
 &= \lVert d - Q \Sigma' Q^T d \rVert_2^2
-\end{align*}
+\end{aligned}
 $$
 
 Let us define $Q^{(k)}$ as the matrix formed by the first $k$ columns of $Q$ and zeros elsewhere, and $\Sigma^{(k)}$ as the matrix formed by the first $k$ rows and columns of $\Sigma'$ and zeros in the rest. Then we can rewrite the error as follows:
@@ -330,7 +330,7 @@ where $\epsilon$ is a predefined threshold. When this condition is met, we stop 
 We can refine this process by optimizing the calculation of $\text{Error}_k$. We can achieve this by only calculating the differences of the errors.
 
 $$
-\begin{align*}
+\begin{aligned}
 \text{Error}_0 &= \lVert d \rVert_2^2 \\
 \text{Error}_k - \text{Error}_{k-1} &= \lVert d - Q^{(k)} \Sigma'^{(k)} Q^{(k)T} d \rVert_2^2 - \lVert d - Q^{(k-1)} \Sigma'^{(k-1)} Q^{(k-1)T} d \rVert_2^2 \\
 &= \left( \lVert d \rVert_2^2 - 2 \sum_{i=1}^k{d^T q_i \sigma'_i q_i^T d} + \sum_{i = 1}^{k}{d^T q_i^T \sigma_i' q_i q_i \sigma_i' q_i^T d}\right) \\
@@ -340,7 +340,7 @@ $$
 &=\left( \lVert d \rVert_2^2 + \sum_{i=1}^k{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right)\\
 &\:\:\:\:-\left( \lVert d \rVert_2^2 + \sum_{i=1}^{k-1}{\sigma_i'\left(\sigma_i' - 2\right)\left( q_i^T d \right)^2} \right) \\
 &= \sigma_k'\left(\sigma_k' - 2\right)\left( q_k^T d \right)^2
-\end{align*}
+\end{aligned}
 $$
 
 $$
