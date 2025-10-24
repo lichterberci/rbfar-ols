@@ -175,10 +175,12 @@ class ProposedModifiedEMVPConfig(ExperimentConfig):
     centre_restarts: int = 1
 
     # Additional parameters for novel modifications
-    # Add your custom parameters here as needed
-    # For example:
-    # adaptive_widths: bool = False
-    # custom_regularization: float = 0.0
+    # TSVD parameters for function parameter learning
+    use_tsvd: bool = True  # Use TSVD instead of L2 regularization
+    tsvd_epsilon: float = 1e-2  # Convergence threshold for TSVD
+    tsvd_alpha: float = 1e-5  # Regularization parameter for TSVD
+    tsvd_delta: float = 1e-6  # Sparsity threshold for TSVD
+    tsvd_beta: Optional[float] = None  # Max singular value clipping
 
 
 def estimate_embedding_dimension_cao(y: np.ndarray, tau, max_m: int = 20) -> int:
@@ -229,6 +231,7 @@ def run_proposed_experiment(
     config: Union[ProposedMethodConfig, ProposedModifiedEMVPConfig],
     train_ratio: float = 0.7,
     device: str = "cpu",
+    seed: int = 0,
 ) -> ExperimentResult:
     """
     Run proposed method experiment with SVD/OLS-based methods or Modified EM-VP.
@@ -243,6 +246,11 @@ def run_proposed_experiment(
         ExperimentResult containing predictions and metadata
     """
     series = series.astype(np.float32)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # Estimate tau from autocorrelation
     if config.embedding_tau is not None:
@@ -687,6 +695,7 @@ def run_control_experiment(
     config: ControlConfig,
     train_ratio: float = 0.7,
     device: str = "cpu",
+    seed: int = 0,
 ) -> ExperimentResult:
     """
     Run control experiment with either the Adam-optimized RBF method or the EM-VP algorithm.
@@ -701,6 +710,11 @@ def run_control_experiment(
         ExperimentResult containing predictions and metadata
     """
     series = series.astype(np.float32)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     tau = (
         config.embedding_tau
@@ -1018,6 +1032,12 @@ def _run_proposed_with_modified_emvp(
             dtype=dtype,
             loglik_window=config.loglik_window,
             responsibility_floor=config.responsibility_floor,
+            # TSVD parameters
+            use_tsvd=config.use_tsvd,
+            tsvd_epsilon=config.tsvd_epsilon,
+            tsvd_alpha=config.tsvd_alpha,
+            tsvd_delta=config.tsvd_delta,
+            tsvd_beta=config.tsvd_beta,
         )
 
         trainer = ModifiedEMVPTrainer(trainer_config)
@@ -1257,6 +1277,7 @@ def run_comparison_experiments(
     device: str = "cpu",
     run_parallel: bool = False,
     show_progress: bool = True,
+    seed: int = 0,
 ) -> Tuple[
     Union[ExperimentResult, List[ExperimentResult]],
     Union[ExperimentResult, List[ExperimentResult]],
@@ -1305,11 +1326,11 @@ def run_comparison_experiments(
 
     run_proposed_exp_and_update_progress = lambda cfg: (
         progress_bar.update(1),
-        run_proposed_experiment(series, cfg, train_ratio, device),
+        run_proposed_experiment(series, cfg, train_ratio, device, seed=seed),
     )[1]
     run_control_exp_and_update_progress = lambda cfg: (
         progress_bar.update(1),
-        run_control_experiment(series, cfg, train_ratio, device),
+        run_control_experiment(series, cfg, train_ratio, device, seed=seed),
     )[1]
     # Determine config types
     proposed_is_single = isinstance(proposed_config, ProposedMethodConfig)

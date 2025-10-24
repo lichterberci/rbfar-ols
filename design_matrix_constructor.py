@@ -595,9 +595,18 @@ def construct_design_matrix_with_local_pretraining(
 
         eye_aug = torch.eye(n + 1, device=device, dtype=dtype)
         # Vectorized computation to replace the loop
+
+        theta = torch.exp(
+            torch.tensor(-1 / 4, device=device, dtype=dtype)
+        )  # the value of Phi at the halfway point
+
         Xi_mask = torch.where(
-            phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
+            phi > theta, phi, torch.tensor(0.0, device=device, dtype=dtype)
         )  # (l, m)
+
+        # Xi_mask = torch.where(
+        #     phi > rho, phi, torch.tensor(0.0, device=device, dtype=dtype)
+        # )  # (l, m)
         X_masked_out = Xi_mask.unsqueeze(-1) * X_aug.unsqueeze(1)  # (l, m, n+1)
         a = torch.einsum(
             "lmi, lmj -> mij", X_masked_out, X_masked_out
