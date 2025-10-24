@@ -35,6 +35,12 @@ from optimizer import Optimizer
 from svd_based_optimizer import SvdOptimizer
 
 from em_vp import EMVPConfig, EMVPDiagnostics, EMVPModel, EMVPTrainer
+from modified_em_vp import (
+    ModifiedEMVPConfig,
+    ModifiedEMVPDiagnostics,
+    ModifiedEMVPModel,
+    ModifiedEMVPTrainer,
+)
 
 
 @dataclass
@@ -144,6 +150,37 @@ class ControlEMVPConfig(ControlConfig):
     centre_restarts: int = 1
 
 
+@dataclass
+class ProposedModifiedEMVPConfig(ExperimentConfig):
+    """Configuration for proposed experiments using the Modified EM-VP algorithm.
+
+    This allows experimenting with novel modifications to the EM-VP algorithm
+    as a proposed method alongside SVD/OLS-based approaches.
+    """
+
+    # Core EM-VP parameters (similar to ControlEMVPConfig but as a proposed method)
+    num_components: int = 5
+    max_iters: int = 200
+    tol_loglik: float = 1e-5
+    tol_param: float = 1e-4
+    min_variance: float = 1e-6
+    ridge: float = 1e-5
+    init_responsibility_temp: float = 1.0
+    init_width_scale: float = 0.5
+    loglik_window: int = 5
+    responsibility_floor: float = 1e-8
+    device: Optional[str] = None
+    dtype: torch.dtype = torch.float32
+    centre_sampling_ratio: float = 1.0
+    centre_restarts: int = 1
+
+    # Additional parameters for novel modifications
+    # Add your custom parameters here as needed
+    # For example:
+    # adaptive_widths: bool = False
+    # custom_regularization: float = 0.0
+
+
 def estimate_embedding_dimension_cao(y: np.ndarray, tau, max_m: int = 20) -> int:
     """Estimate embedding dimension using Cao's method."""
 
@@ -189,16 +226,16 @@ def estimate_tau_for_series(y: np.ndarray) -> int:
 
 def run_proposed_experiment(
     series: np.ndarray,
-    config: ProposedMethodConfig,
+    config: Union[ProposedMethodConfig, ProposedModifiedEMVPConfig],
     train_ratio: float = 0.7,
     device: str = "cpu",
 ) -> ExperimentResult:
     """
-    Run proposed method experiment with SVD/OLS-based methods.
+    Run proposed method experiment with SVD/OLS-based methods or Modified EM-VP.
 
     Args:
         series: Time series data (noisy version)
-        config: Proposed method experiment configuration
+        config: Proposed method experiment configuration (ProposedMethodConfig or ProposedModifiedEMVPConfig)
         train_ratio: Ratio of data to use for training
         device: Device to run computations on
 
@@ -234,7 +271,20 @@ def run_proposed_experiment(
     d_train = torch.from_numpy(d_train).to(device)
     d_test = torch.from_numpy(d_test).to(device)
 
-    # Estimate sigma if not provided
+    # Handle ProposedModifiedEMVPConfig separately
+    if isinstance(config, ProposedModifiedEMVPConfig):
+        return _run_proposed_with_modified_emvp(
+            config=config,
+            X_train=X_train,
+            X_test=X_test,
+            d_train=d_train,
+            d_test=d_test,
+            tau=tau,
+            n=n,
+            base_device=device,
+        )
+
+    # Estimate sigma if not provided (for ProposedMethodConfig only)
     sigma_val = config.sigma
     if sigma_val is None:
         sigma_val = estimate_sigma_median(X_train.numpy())
@@ -866,6 +916,151 @@ def _run_control_with_gradient_descent(
         train_targets=d_train.cpu().numpy(),
         test_targets=d_test.cpu().numpy(),
         method_name="Control-Adam-RBF",
+        metadata=metadata,
+    )
+
+
+def _run_proposed_with_modified_emvp(
+    *,
+    config: ProposedModifiedEMVPConfig,
+    X_train: torch.Tensor,
+    X_test: torch.Tensor,
+    d_train: torch.Tensor,
+    d_test: torch.Tensor,
+    tau: int,
+    n: int,
+    base_device: str,
+) -> ExperimentResult:
+    """Execute the Modified EM-VP-based proposed method."""
+
+    effective_device = config.device or base_device
+    dtype = config.dtype
+
+    if X_train.shape[0] == 0:
+        raise ValueError(
+            "Not enough training samples for Modified EM-VP proposed method."
+        )
+
+    X_train_device = X_train.to(device=effective_device, dtype=dtype)
+    X_test_device = X_test.to(device=effective_device, dtype=dtype)
+    d_train_device = d_train.to(device=effective_device, dtype=dtype)
+
+    def _sample_initial_centres() -> torch.Tensor:
+        pool_size = max(1, int(config.centre_sampling_ratio * X_train_device.shape[0]))
+        pool_indices = torch.randperm(X_train_device.shape[0], device=effective_device)[
+            :pool_size
+        ]
+        if pool_indices.numel() > 1:
+            shuffle = torch.randperm(pool_indices.numel(), device=effective_device)
+            pool_indices = pool_indices[shuffle]
+        if pool_indices.numel() >= config.num_components:
+            return X_train_device[pool_indices[: config.num_components]].clone()
+        else:
+            # Pad with repeated samples if needed
+            repeats = (
+                config.num_components + pool_indices.numel() - 1
+            ) // pool_indices.numel()
+            indices_repeated = pool_indices.repeat(repeats)[: config.num_components]
+            return X_train_device[indices_repeated].clone()
+
+    best_log_likelihood = float("-inf")
+    best_model = None
+    best_diagnostics = None
+
+    for restart in range(config.centre_restarts):
+        centres_init = _sample_initial_centres()
+
+        # Estimate initial widths based on pairwise distances
+        if centres_init.shape[0] > 1:
+            pairwise_dists = torch.cdist(centres_init, centres_init, p=2)
+            # Use median of non-zero distances
+            upper_tri_dists = pairwise_dists[
+                torch.triu_indices(
+                    centres_init.shape[0], centres_init.shape[0], offset=1
+                )
+            ]
+            median_dist = (
+                upper_tri_dists.median()
+                if upper_tri_dists.numel() > 0
+                else torch.tensor(1.0)
+            )
+            width_init_val = median_dist * config.init_width_scale
+        else:
+            width_init_val = torch.tensor(1.0, device=effective_device, dtype=dtype)
+
+        widths_init = torch.full(
+            (config.num_components,),
+            width_init_val,
+            device=effective_device,
+            dtype=dtype,
+        )
+
+        # Initialize noise variance
+        noise_base = d_train_device.var(unbiased=False).item()
+        noise_init = torch.full(
+            (config.num_components,),
+            float(noise_base + config.min_variance),
+            device=effective_device,
+            dtype=dtype,
+        )
+
+        # Create the modified trainer config
+        trainer_config = ModifiedEMVPConfig(
+            num_components=config.num_components,
+            max_iters=config.max_iters,
+            tol_loglik=config.tol_loglik,
+            tol_param=config.tol_param,
+            min_variance=config.min_variance,
+            ridge=config.ridge,
+            init_responsibility_temp=config.init_responsibility_temp,
+            init_width_scale=config.init_width_scale,
+            device=effective_device,
+            dtype=dtype,
+            loglik_window=config.loglik_window,
+            responsibility_floor=config.responsibility_floor,
+        )
+
+        trainer = ModifiedEMVPTrainer(trainer_config)
+        model = trainer.fit(
+            X_train_device,
+            d_train_device,
+            centres_init=centres_init,
+            widths_init=widths_init,
+            noise_init=noise_init,
+        )
+
+        if trainer.diagnostics.log_likelihood:
+            final_loglik = trainer.diagnostics.log_likelihood[-1]
+        else:
+            final_loglik = float("-inf")
+
+        if final_loglik > best_log_likelihood:
+            best_log_likelihood = final_loglik
+            best_model = model
+            best_diagnostics = trainer.diagnostics
+
+    if best_model is None or best_diagnostics is None:
+        raise RuntimeError("Modified EM-VP training did not produce a valid model")
+
+    train_pred = best_model.predict(X_train_device).detach().cpu().numpy()
+    test_pred = best_model.predict(X_test_device).detach().cpu().numpy()
+
+    metadata = {
+        "tau": tau,
+        "n": n,
+        "num_components": config.num_components,
+        "final_log_likelihood": best_log_likelihood,
+        "optimizer_type": "ModifiedEMVP",
+        "num_iterations": len(best_diagnostics.log_likelihood),
+        "approach": "modified-emvp",
+    }
+
+    return ExperimentResult(
+        train_predictions=train_pred,
+        train_targets=d_train.detach().cpu().numpy(),
+        test_predictions=test_pred,
+        test_targets=d_test.detach().cpu().numpy(),
+        method_name=f"PROPOSED-ModifiedEMVP-{config.num_components}components",
         metadata=metadata,
     )
 

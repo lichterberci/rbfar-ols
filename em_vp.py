@@ -138,6 +138,11 @@ class EMVPTrainer:
         self.diagnostics = EMVPDiagnostics()
         self._fitted_state: Optional[EMVPState] = None
 
+    @property
+    def cfg(self) -> EMVPConfig:
+        """Convenient access to config."""
+        return self.config
+
     def fit(
         self,
         X: Tensor,
@@ -151,8 +156,8 @@ class EMVPTrainer:
         """Run the EM iterations until convergence, returning a model."""
 
         cfg = self.config
-        X = _ensure_tensor(X, cfg)
-        y = _ensure_tensor(y, cfg).reshape(-1, 1)
+        X = self._ensure_tensor(X)
+        y = self._ensure_tensor(y).reshape(-1, 1)
 
         if X.ndim != 2:
             raise ValueError("X must be a 2D tensor")
@@ -162,8 +167,8 @@ class EMVPTrainer:
         N = X.shape[0]
         device = X.device
 
-        centres = _init_centres(X, centres_init, cfg)
-        widths = _init_widths(X, centres, widths_init, cfg)
+        centres = self._init_centres(X, centres_init)
+        widths = self._init_widths(X, centres, widths_init)
         mixing_logits = (
             mixing_logits_init.clone().to(device=device, dtype=X.dtype)
             if mixing_logits_init is not None
@@ -180,28 +185,28 @@ class EMVPTrainer:
             )
         )
 
-        function_params = _init_function_params(X, y, centres.shape[0], cfg)
-        responsibilities = _init_responsibilities(N, centres.shape[0], cfg, device)
+        function_params = self._init_function_params(X, y, centres.shape[0])
+        responsibilities = self._init_responsibilities(N, centres.shape[0], device)
 
         for iteration in range(cfg.max_iters):
-            features = _gaussian_activations(X, centres, widths)
-            local_means = _compute_local_means(X, features, function_params)
-            log_prob = _component_log_prob(
+            features = self._gaussian_activations(X, centres, widths)
+            local_means = self._compute_local_means(X, features, function_params)
+            log_prob = self._component_log_prob(
                 y, local_means, features, mixing_logits, noise_vars
             )
-            responsibilities = _normalize_log_prob(log_prob, cfg)
+            responsibilities = self._normalize_log_prob(log_prob)
 
-            centres_new, widths_new = _update_centres_widths(X, responsibilities, cfg)
-            function_params_new = _update_function_params(
-                X, y, responsibilities, features, function_params, cfg
+            centres_new, widths_new = self._update_centres_widths(X, responsibilities)
+            function_params_new = self._update_function_params(
+                X, y, responsibilities, features, function_params
             )
-            noise_vars_new = _update_noise_new(
-                X, y, responsibilities, features, function_params_new, cfg
+            noise_vars_new = self._update_noise_new(
+                X, y, responsibilities, features, function_params_new
             )
-            mixing_logits_new = _update_mixing(responsibilities)
+            mixing_logits_new = self._update_mixing(responsibilities)
 
-            log_likelihood = _log_likelihood_from_log_prob(log_prob)
-            max_param_delta = _max_parameter_delta(
+            log_likelihood = self._log_likelihood_from_log_prob(log_prob)
+            max_param_delta = self._max_parameter_delta(
                 (
                     centres,
                     widths,
@@ -217,7 +222,7 @@ class EMVPTrainer:
                     noise_vars_new,
                 ),
             )
-            entropy = _responsibility_entropy(responsibilities)
+            entropy = self._responsibility_entropy(responsibilities)
 
             self.diagnostics.log_likelihood.append(log_likelihood.item())
             self.diagnostics.max_param_update.append(max_param_delta.item())
@@ -229,7 +234,7 @@ class EMVPTrainer:
             noise_vars = noise_vars_new
             mixing_logits = mixing_logits_new
 
-            if _should_stop(self.diagnostics, cfg, iteration):
+            if self._should_stop(iteration):
                 break
 
         final_state = EMVPState(
@@ -249,6 +254,307 @@ class EMVPTrainer:
         if self._fitted_state is None:
             raise RuntimeError("Model not yet fitted. Call fit() first.")
         return self._fitted_state
+
+    # Overridable methods for customization
+    def _ensure_tensor(self, data: Tensor | Iterable[float]) -> Tensor:
+        """Convert data to tensor with specified device and dtype."""
+        device = torch.device(self.cfg.device)
+        if isinstance(data, torch.Tensor):
+            return data.to(device=device, dtype=self.cfg.dtype)
+        return torch.as_tensor(data, device=device, dtype=self.cfg.dtype)
+
+    def _init_centres(self, X: Tensor, centres_init: Optional[Tensor]) -> Tensor:
+        """Initialize RBF centres."""
+        if centres_init is not None:
+            if centres_init.ndim != 2:
+                raise ValueError("centres_init must be a 2D tensor")
+            return centres_init.to(device=X.device, dtype=X.dtype)
+
+        # Sample without replacement when possible
+        N = X.shape[0]
+        m = min(max(self.cfg.num_components, 1), N)
+        perm = torch.randperm(N, device=X.device)
+        return X[perm[:m]].clone()
+
+    def _init_widths(
+        self, X: Tensor, centres: Tensor, widths_init: Optional[Tensor]
+    ) -> Tensor:
+        """Initialize RBF widths."""
+        if widths_init is not None:
+            widths = widths_init.to(device=X.device, dtype=X.dtype)
+            if widths.ndim == 0:
+                widths = widths.expand(centres.shape[0])
+            return widths
+
+        if centres.shape[0] == 1:
+            width_value = (X.std(unbiased=False) * self.cfg.init_width_scale).item()
+            return torch.full((1,), float(width_value), device=X.device, dtype=X.dtype)
+
+        pairwise_dists = torch.cdist(centres, centres, p=2)
+        upper = pairwise_dists[
+            torch.triu_indices(centres.shape[0], centres.shape[0], offset=1)
+        ]
+        median_dist = upper.median()
+        width = median_dist * self.cfg.init_width_scale
+        width = torch.clamp(width, min=self.cfg.min_variance**0.5)
+        return torch.full((centres.shape[0],), width, device=X.device, dtype=X.dtype)
+
+    def _init_function_params(self, X: Tensor, y: Tensor, m: int) -> Tensor:
+        """Initialize function parameters for (n+1) functions with (m+1) parameters each."""
+        device = X.device
+        dtype = X.dtype
+        n = X.shape[1]
+        num_components = self.cfg.num_components
+
+        # Initialize with small random values
+        function_params = 0.01 * torch.randn(
+            num_components, n + 1, m + 1, device=device, dtype=dtype
+        )
+
+        # Initialize global terms from simple linear regression
+        ridge = self.cfg.ridge
+        ones_col = torch.ones(X.shape[0], 1, device=device, dtype=dtype)
+        X_aug = torch.cat([ones_col, X], dim=1)  # (N, n+1)
+        XtX = X_aug.T @ X_aug + ridge * torch.eye(n + 1, device=device, dtype=dtype)
+        XtY = X_aug.T @ y.squeeze()
+        base_params = torch.linalg.lstsq(XtX, XtY).solution  # (n+1,)
+
+        # Set global terms (index 0) for all components and functions
+        for k in range(num_components):
+            function_params[k, :, 0] = base_params  # Global terms
+
+        return function_params
+
+    def _init_responsibilities(self, N: int, m: int, device: torch.device) -> Tensor:
+        """Initialize responsibilities."""
+        logits = torch.zeros((N, m), device=device)
+        logits = logits + torch.randn_like(logits) * self.cfg.init_responsibility_temp
+        return torch.softmax(logits, dim=1)
+
+    def _gaussian_activations(
+        self, X: Tensor, centres: Tensor, widths: Tensor
+    ) -> Tensor:
+        """Compute Gaussian RBF activations efficiently using cdist."""
+        # Use torch.cdist for efficient pairwise distance computation
+        dists = torch.cdist(X, centres, p=2)  # (N, m)
+        widths_sq = torch.clamp(widths, min=1e-12) ** 2
+        return torch.exp(-(dists**2) / (2.0 * widths_sq.unsqueeze(0)))
+
+    def _compute_local_means(
+        self, X: Tensor, features: Tensor, function_params: Tensor
+    ) -> Tensor:
+        """Compute local means for each component using the function parameters."""
+        N, n = X.shape
+        m = features.shape[1]
+        num_components = function_params.shape[0]
+
+        # Vectorized computation: avoid loops over components and features
+        # Create extended features: [1, Ψ₁, Ψ₂, ..., Ψₘ] for all samples
+        features_ext = torch.cat(
+            [torch.ones(N, 1, device=X.device, dtype=X.dtype), features], dim=1
+        )  # (N, m+1)
+
+        # Compute all φᵢ(X) values at once for all components
+        # φᵢ(X) = νᵢ,₀ + Σⱼ νᵢ,ⱼ Ψⱼ(X) = features_ext @ function_params[k, i, :]
+
+        # Reshape for batch matrix multiplication
+        # function_params: (K, n+1, m+1) -> (K*(n+1), m+1)
+        params_flat = function_params.view(-1, m + 1)  # (K*(n+1), m+1)
+
+        # Compute all φᵢᵏ(X) values: (N, K*(n+1))
+        phi_all = features_ext @ params_flat.T  # (N, K*(n+1))
+
+        # Reshape back to (N, K, n+1)
+        phi_reshaped = phi_all.view(N, num_components, n + 1)  # (N, K, n+1)
+
+        # Extract φ₀ (constant terms) and φᵢ (coefficient terms)
+        phi_0 = phi_reshaped[:, :, 0]  # (N, K)
+        phi_coeffs = phi_reshaped[:, :, 1:]  # (N, K, n)
+
+        # Compute coefficient contributions: Σᵢ φᵢ(X) * Xᵢ
+        # X: (N, n) -> (N, 1, n), phi_coeffs: (N, K, n)
+        X_expanded = X.unsqueeze(1)  # (N, 1, n)
+        coeff_contributions = (X_expanded * phi_coeffs).sum(dim=2)  # (N, K)
+
+        # Final local means: φ₀ + Σᵢ φᵢ(X) * Xᵢ
+        local_means = phi_0 + coeff_contributions  # (N, K)
+
+        return local_means
+
+    def _log_normal_pdf(self, x: Tensor, mean: Tensor, var: Tensor) -> Tensor:
+        """Compute log normal PDF."""
+        var = torch.clamp(var, min=1e-12)
+        return -0.5 * (torch.log(var) + ((x - mean) ** 2) / var + log(2.0 * pi))
+
+    def _component_log_prob(
+        self,
+        y: Tensor,
+        local_means: Tensor,
+        features: Tensor,
+        mixing_logits: Tensor,
+        noise_vars: Tensor,
+    ) -> Tensor:
+        """Compute component log probabilities."""
+        log_mixing = torch.log_softmax(mixing_logits, dim=0)
+        log_gauss = torch.log(features + 1e-12)
+        log_conditional = self._log_normal_pdf(y, local_means, noise_vars.unsqueeze(0))
+        return log_mixing.unsqueeze(0) + log_gauss + log_conditional
+
+    def _normalize_log_prob(self, log_prob: Tensor) -> Tensor:
+        """Normalize log probabilities to get responsibilities."""
+        log_prob = log_prob - log_prob.max(dim=1, keepdim=True).values
+        responsibilities = torch.softmax(log_prob, dim=1)
+        responsibilities = responsibilities.clamp_min(self.cfg.responsibility_floor)
+        responsibilities = responsibilities / responsibilities.sum(dim=1, keepdim=True)
+        return responsibilities
+
+    def _update_centres_widths(
+        self, X: Tensor, responsibilities: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Update centres and widths."""
+        Nk = responsibilities.sum(dim=0).clamp_min(self.cfg.responsibility_floor)
+        centres_new = (responsibilities.T @ X) / Nk.unsqueeze(1)
+
+        diff = X.unsqueeze(1) - centres_new.unsqueeze(0)
+        sq_norm = (diff * diff).sum(dim=2)
+        widths_sq = (responsibilities * sq_norm).sum(dim=0) / (Nk * X.shape[1])
+        widths_sq = widths_sq.clamp_min(self.cfg.min_variance)
+        widths_new = torch.sqrt(widths_sq)
+        return centres_new, widths_new
+
+    def _update_function_params(
+        self,
+        X: Tensor,
+        y: Tensor,
+        responsibilities: Tensor,
+        features: Tensor,
+        current_function_params: Tensor,
+    ) -> Tensor:
+        """Update function parameters using weighted least squares for each component."""
+        N, n = X.shape
+        m = features.shape[1]
+        num_components = responsibilities.shape[1]
+        ridge = self.cfg.ridge
+
+        # Pre-compute design matrix once (this was the main bottleneck)
+        ones_col = torch.ones(N, 1, device=X.device, dtype=X.dtype)
+        features_ext = torch.cat([ones_col, features], dim=1)  # (N, m+1)
+
+        # Efficiently build the full design matrix using broadcasting
+        # φ₀ terms: [1, Ψ₁, Ψ₂, ..., Ψₘ]
+        phi_0_design = features_ext  # (N, m+1)
+
+        # φᵢ terms for i=1..n: [Xᵢ, Xᵢ*Ψ₁, Xᵢ*Ψ₂, ..., Xᵢ*Ψₘ]
+        # Use broadcasting: X.unsqueeze(2) * features_ext.unsqueeze(1)
+        X_ext = X.unsqueeze(2)  # (N, n, 1)
+        features_broadcast = features_ext.unsqueeze(1)  # (N, 1, m+1)
+        phi_coeff_designs = X_ext * features_broadcast  # (N, n, m+1)
+
+        # Reshape to (N, n*(m+1))
+        phi_coeff_designs_flat = phi_coeff_designs.view(N, n * (m + 1))
+
+        # Full design matrix: [φ₀_terms, φ₁_terms, ..., φₙ_terms]
+        full_design = torch.cat(
+            [phi_0_design, phi_coeff_designs_flat], dim=1
+        )  # (N, (n+1)*(m+1))
+
+        function_params_new = torch.zeros_like(current_function_params)
+
+        # Batch solve for all components using vectorized operations
+        sqrt_responsibilities = torch.sqrt(
+            responsibilities.clamp_min(self.cfg.responsibility_floor)
+        )  # (N, K)
+
+        # Vectorized weighted design matrix computation
+        # sqrt_responsibilities: (N, K) -> (N, K, 1)
+        sqrt_resp_expanded = sqrt_responsibilities.unsqueeze(2)  # (N, K, 1)
+        # full_design: (N, D) -> (N, 1, D)
+        design_expanded = full_design.unsqueeze(1)  # (N, 1, D)
+        # Weighted design for all components: (N, K, D)
+        weighted_designs = sqrt_resp_expanded * design_expanded  # (N, K, D)
+
+        # Weighted targets for all components: (N, K)
+        y_squeezed = y.squeeze()  # (N,)
+        weighted_targets = sqrt_responsibilities * y_squeezed.unsqueeze(1)  # (N, K)
+
+        D = full_design.shape[1]  # (n+1)*(m+1)
+        ridge_eye = ridge * torch.eye(D, device=X.device, dtype=X.dtype)
+
+        for k in range(num_components):
+            # Extract weighted design and targets for component k
+            weighted_design_k = weighted_designs[:, k, :]  # (N, D)
+            weighted_y_k = weighted_targets[:, k]  # (N,)
+
+            # Normal equations: (D^T D + λI) θ = D^T y
+            AtA = weighted_design_k.T @ weighted_design_k + ridge_eye  # (D, D)
+            Atb = weighted_design_k.T @ weighted_y_k  # (D,)
+
+            # Solve and reshape
+            params_flat = torch.linalg.lstsq(AtA, Atb).solution  # (D,)
+            function_params_new[k] = params_flat.reshape(n + 1, m + 1)
+
+        return function_params_new
+
+    def _update_noise_new(
+        self,
+        X: Tensor,
+        y: Tensor,
+        responsibilities: Tensor,
+        features: Tensor,
+        function_params: Tensor,
+    ) -> Tensor:
+        """Update noise variances using the new function parameters structure."""
+        local_means = self._compute_local_means(
+            X, features, function_params
+        )  # (N, num_components)
+        residuals = y.squeeze().unsqueeze(1) - local_means  # (N, num_components)
+        sq_resid = residuals.pow(2)
+        Nk = responsibilities.sum(dim=0).clamp_min(self.cfg.responsibility_floor)
+        noise = (responsibilities * sq_resid).sum(dim=0) / Nk
+        noise = noise.clamp_min(self.cfg.min_variance)
+        return noise
+
+    def _update_mixing(self, responsibilities: Tensor) -> Tensor:
+        """Update mixing logits."""
+        probs = responsibilities.mean(dim=0)
+        return torch.log(probs + 1e-12)
+
+    def _log_likelihood_from_log_prob(self, log_prob: Tensor) -> Tensor:
+        """Compute log likelihood from log probabilities."""
+        max_per_row = log_prob.max(dim=1, keepdim=True).values
+        stabilised = log_prob - max_per_row
+        return (max_per_row.squeeze(1) + torch.logsumexp(stabilised, dim=1)).sum()
+
+    def _max_parameter_delta(self, before, after) -> Tensor:
+        """Compute maximum parameter delta."""
+        deltas = [torch.max(torch.abs(b - a)) for b, a in zip(before, after)]
+        return torch.stack(deltas).max()
+
+    def _responsibility_entropy(self, responsibilities: Tensor) -> Tensor:
+        """Compute responsibility entropy."""
+        log_resp = torch.log(responsibilities + 1e-12)
+        entropy = -(responsibilities * log_resp).sum(dim=1).mean()
+        return entropy
+
+    def _should_stop(self, iteration: int) -> bool:
+        """Check if training should stop."""
+        if iteration < 1:
+            return False
+
+        if self.diagnostics.max_param_update[-1] < self.cfg.tol_param:
+            return True
+
+        window = min(self.cfg.loglik_window, len(self.diagnostics.log_likelihood))
+        if window >= 2:
+            recent_improvements = [
+                self.diagnostics.log_likelihood[-i - 1]
+                - self.diagnostics.log_likelihood[-i - 2]
+                for i in range(window - 1)
+            ]
+            avg_improvement = sum(recent_improvements) / len(recent_improvements)
+            if avg_improvement < self.cfg.tol_loglik:
+                return True
+        return False
 
 
 # ---------------------------------------------------------------------------
